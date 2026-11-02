@@ -1,0 +1,17 @@
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF with fsync every second: a Redis restart loses at most ~1s of writes.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  redis-data:

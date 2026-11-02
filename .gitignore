@@ -1,0 +1,9 @@
+/bin/
+*.test
+coverage.out
+.env
+.DS_Store
+
+# Files a local redis-server writes if started from this folder
+dump.rdb
+appendonlydir/
