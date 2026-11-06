@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shambutn/job-scheduler/internal/config"
+	"github.com/sham-33/job-scheduler/internal/config"
 )
 
 // testDB keeps tests away from the data a local worker uses in DB 0.
