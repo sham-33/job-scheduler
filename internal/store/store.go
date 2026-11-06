@@ -1,5 +1,5 @@
-// Package store owns the Redis connection. Later phases add the key names
-// and the Lua scripts that make every job state change atomic.
+// Package store owns the Redis connection and the name of every Redis key
+// the system uses.
 package store
 
 import (
@@ -9,7 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/shambutn/job-scheduler/internal/config"
+	"github.com/sham-33/job-scheduler/internal/config"
 )
 
 // pingTimeout bounds the startup check so a wrong REDIS_ADDR fails fast.

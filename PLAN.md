@@ -83,19 +83,22 @@ All timestamps inside scripts come from `redis.call('TIME')`, so every node agre
 ```
 cmd/{api,scheduler,worker,jobctl,loadgen,chaos}/
 internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard,events}/
-internal/store/scripts/*.lua   (embedded with embed.FS)
-handlers/                      (example job types: sleep, echo, flaky)
+internal/queue/scripts/*.lua   (embedded with go:embed, next to the Go code that calls them)
+internal/handlers/             (example job types: sleep, echo, flaky)
+internal/store/storetest/      (test helper: real Redis on DB 15 plus a key prefix per test)
 docs/{design.md,results.md,interview.md}
 ```
+
+Every key name comes from `store.Keys`, which adds an optional prefix. Production uses no prefix. Each test gets a random prefix, so test packages can run in parallel against one Redis.
 
 **Reuse from Phase 0:**
 - `config.Load()` ([internal/config/config.go](internal/config/config.go)) already has `Concurrency`, `LeaseTTL`, `HeartbeatEvery`, `ReapEvery` and `HTTPAddr`.
 - `store.Connect()` ([internal/store/store.go](internal/store/store.go)).
 - `logging.New()` ([internal/logging/logging.go](internal/logging/logging.go)).
 - The `signal.NotifyContext` shutdown pattern in [cmd/worker/main.go](cmd/worker/main.go).
-- The test conventions in `internal/store/store_test.go`: DB 15, `REDIS_TEST_ADDR`, and skip when Redis is down.
+- `storetest.Client(t)` and `storetest.Keys(t, rdb)` ([internal/store/storetest](internal/store/storetest/storetest.go)) for every Redis integration test.
 
-**Dependencies to add when needed:** `github.com/google/uuid` (Phase 1), `github.com/robfig/cron/v3` (Phase 6), `github.com/spf13/cobra` (Phase 8).
+**Dependencies to add when needed:** `github.com/robfig/cron/v3` (Phase 6), `github.com/spf13/cobra` (Phase 8). `github.com/google/uuid` was added in Phase 1.
 
 ---
 
@@ -105,7 +108,13 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 1: Housekeeping, the job model, enqueue, and a single worker
+## Phase 1: Housekeeping, the job model, enqueue, and a single worker ✅ done
+
+**As built, differences from the steps below:**
+- The Lua scripts live in `internal/queue/scripts/`, not `internal/store/`.
+- `scripts/lib.lua` provides a shared `now_ms()` and is prepended to every script.
+- The handlers live in `internal/handlers/`.
+- A failed job stays `running` until Phases 3 and 4 add the reaper and retries.
 
 **Housekeeping first:**
 1. Fix `README.md`. Drop the conflict markers and GitHub's one-line `# job-scheduler` heading, and keep the full Phase 0 README.

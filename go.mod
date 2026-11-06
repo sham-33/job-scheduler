@@ -1,8 +1,11 @@
-module github.com/shambutn/job-scheduler
+module github.com/sham-33/job-scheduler
 
 go 1.27.3
 
-require github.com/redis/go-redis/v9 v9.23.0
+require (
+	github.com/google/uuid v1.6.0
+	github.com/redis/go-redis/v9 v9.23.0
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
