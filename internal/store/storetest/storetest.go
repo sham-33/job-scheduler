@@ -15,8 +15,12 @@ import (
 	"github.com/sham-33/job-scheduler/internal/store"
 )
 
-// DB keeps tests away from the data a local worker uses in DB 0.
-const DB = 15
+const (
+	// DB keeps tests away from the data a local worker uses in DB 0.
+	DB = 15
+	// concurrency sizes the connection pool for the busiest test.
+	concurrency = 25
+)
 
 // Client connects to REDIS_TEST_ADDR (default localhost:6379) and skips the
 // test when Redis isn't reachable.
@@ -26,7 +30,7 @@ func Client(t testing.TB) *redis.Client {
 	if addr == "" {
 		addr = "localhost:6379"
 	}
-	rdb, err := store.Connect(context.Background(), config.Config{RedisAddr: addr, RedisDB: DB})
+	rdb, err := store.Connect(context.Background(), config.Config{RedisAddr: addr, RedisDB: DB, Concurrency: concurrency})
 	if err != nil {
 		t.Skipf("Redis not reachable at %s (start it with `make redis-up`): %v", addr, err)
 	}

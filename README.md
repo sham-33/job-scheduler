@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [PLAN.md](PLAN.md) has the design and the build phases.
 
-**Status:** Phase 1 is done. A worker runs immediate and delayed jobs one at a time, and submitting with an idempotency key never creates duplicates. Next is Phase 2: 25 concurrent workers.
+**Status:** Phase 2 is done. A worker process runs up to 25 jobs at once, immediate or delayed, and a test proves that 10,000 jobs each run exactly once. Next is Phase 3: surviving a crashed worker.
 
 ## Prerequisites
 
@@ -17,10 +17,14 @@ make run-worker   # claims and runs jobs; Ctrl-C to stop
 make test         # Redis tests skip if Redis isn't running
 ```
 
-Run `make help` for every target. There's no submit command until Phase 8; to watch an immediate and a delayed job run end to end, run:
+Run `make help` for every target. There's no submit command until Phase 8. To watch jobs run end to end, run these tests, which print their timings:
 
 ```bash
-go test -v -run TestWorkerRunsImmediateAndDelayedJobs ./internal/worker/
+go test -v -run TestPoolRunsImmediateAndDelayedJobs ./internal/worker/
+```
+
+```bash
+go test -v -run TestPoolRunsEveryJobExactlyOnce ./internal/worker/
 ```
 
 ## How a job flows
@@ -36,17 +40,17 @@ Each step is one Lua script in [internal/queue/scripts](internal/queue/scripts),
 
 Every binary reads the same environment variables. An empty variable counts as unset.
 
-| Variable            | Default              | Meaning                                                                      |
-| ------------------- | -------------------- | ---------------------------------------------------------------------------- |
-| `NODE_ID`         | `<hostname>-<pid>` | Identifies this process in leases, logs and the worker registry              |
-| `LOG_LEVEL`       | `info`             | `debug`, `info`, `warn` or `error`                                   |
-| `REDIS_ADDR`      | `localhost:6379`   | Redis host and port                                                          |
-| `REDIS_PASSWORD`  | (none)               | Redis password                                                               |
-| `REDIS_DB`        | `0`                | Redis database number. Tests use DB 15                                       |
-| `HTTP_ADDR`       | `:8080`            | API and dashboard listen address                                             |
-| `CONCURRENCY`     | `25`               | Jobs one worker process runs at once                                         |
-| `LEASE_TTL`       | `1500ms`           | How long a claimed job stays owned without a heartbeat                       |
+| Variable          | Default            | Meaning                                                                    |
+| ----------------- | ------------------ | -------------------------------------------------------------------------- |
+| `NODE_ID`         | `<hostname>-<pid>` | Identifies this process in leases, logs and the worker registry            |
+| `LOG_LEVEL`       | `info`             | `debug`, `info`, `warn` or `error`                                         |
+| `REDIS_ADDR`      | `localhost:6379`   | Redis host and port                                                        |
+| `REDIS_PASSWORD`  | (none)             | Redis password                                                             |
+| `REDIS_DB`        | `0`                | Redis database number. Tests use DB 15                                     |
+| `HTTP_ADDR`       | `:8080`            | API and dashboard listen address                                           |
+| `CONCURRENCY`     | `25`               | Jobs one worker process runs at once                                       |
+| `LEASE_TTL`       | `1500ms`           | How long a claimed job stays owned without a heartbeat                     |
 | `HEARTBEAT_EVERY` | `500ms`            | How often a worker extends its leases. Must be at most half of `LEASE_TTL` |
-| `REAP_EVERY`      | `200ms`            | How often the scheduler reclaims expired leases                              |
+| `REAP_EVERY`      | `200ms`            | How often the scheduler reclaims expired leases                            |
 
 Tests read `REDIS_TEST_ADDR` (default `localhost:6379`).

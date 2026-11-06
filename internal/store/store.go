@@ -15,6 +15,16 @@ import (
 // pingTimeout bounds the startup check so a wrong REDIS_ADDR fails fast.
 const pingTimeout = 3 * time.Second
 
+// poolSize is how many Redis connections a process may open. It covers every
+// goroutine that can talk to Redis at once: each job slot can have a claim or
+// completion plus a heartbeat (from Phase 3) in flight, and a few background
+// loops run alongside them. With fewer connections those calls would queue,
+// and a delayed heartbeat could cost a healthy worker its lease.
+func poolSize(concurrency int) int {
+	const background = 4
+	return 2*concurrency + background
+}
+
 // Connect opens a Redis client and verifies it with PING, so a bad address
 // or password fails at startup rather than on the first job.
 func Connect(ctx context.Context, cfg config.Config) (*redis.Client, error) {
@@ -22,6 +32,7 @@ func Connect(ctx context.Context, cfg config.Config) (*redis.Client, error) {
 		Addr:     cfg.RedisAddr,
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
+		PoolSize: poolSize(cfg.Concurrency),
 	})
 
 	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
