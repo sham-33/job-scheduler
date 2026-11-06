@@ -19,8 +19,16 @@ func testAddr() string {
 	return "localhost:6379"
 }
 
+func TestPoolSize(t *testing.T) {
+	for _, concurrency := range []int{1, 5, 25} {
+		if got := poolSize(concurrency); got <= 2*concurrency {
+			t.Errorf("poolSize(%d) = %d, want more than 2 per job slot", concurrency, got)
+		}
+	}
+}
+
 func TestConnect(t *testing.T) {
-	rdb, err := Connect(context.Background(), config.Config{RedisAddr: testAddr(), RedisDB: testDB})
+	rdb, err := Connect(context.Background(), config.Config{RedisAddr: testAddr(), RedisDB: testDB, Concurrency: 5})
 	if err != nil {
 		t.Skipf("Redis not reachable at %s (start it with `make redis-up`): %v", testAddr(), err)
 	}
@@ -28,6 +36,9 @@ func TestConnect(t *testing.T) {
 
 	if got := rdb.Options().DB; got != testDB {
 		t.Errorf("client DB = %d, want %d", got, testDB)
+	}
+	if got, want := rdb.Options().PoolSize, poolSize(5); got != want {
+		t.Errorf("client PoolSize = %d, want %d", got, want)
 	}
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		t.Errorf("Ping after Connect: %v", err)

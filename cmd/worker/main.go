@@ -1,5 +1,5 @@
-// Command worker claims jobs from Redis and runs them, one at a time for now
-// (Phase 2 runs CONCURRENCY at once).
+// Command worker claims jobs from Redis and runs up to CONCURRENCY of them at
+// once.
 package main
 
 import (
@@ -44,16 +44,16 @@ func run() error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer rdb.Close()
-	logger.Info("connected", "redis", cfg.RedisAddr, "db", cfg.RedisDB)
+	logger.Info("connected", "redis", cfg.RedisAddr, "db", cfg.RedisDB, "concurrency", cfg.Concurrency)
 
 	q := queue.New(rdb, store.Keys{}, cfg.LeaseTTL)
-	w := worker.New(cfg.NodeID, q, handlers.Default(), logger)
+	pool := worker.NewPool(cfg.NodeID, cfg.Concurrency, q, handlers.Default(), logger)
 
 	var wg sync.WaitGroup
 	// Temporary: Phase 5 moves the promoter into the scheduler service, so
 	// only the elected leader runs it.
 	wg.Go(func() { scheduler.RunPromoter(ctx, q, logger) })
-	wg.Go(func() { w.Run(ctx) })
+	wg.Go(func() { pool.Run(ctx) })
 
 	<-ctx.Done()
 	logger.Info("shutting down")

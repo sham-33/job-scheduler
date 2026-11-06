@@ -9,6 +9,7 @@ The goal is the project in this resume bullet:
 **Change of approach:** Claude now implements the whole project (code, tests, running it, verifying it). You handle **all git work**: branches, commits, pushes and merges. Extras in scope: **HTTP API + CLI**, **cron schedules**, **web dashboard**.
 
 **Current state**
+
 - Phase 0 is done and merged to `main` at `github.com/sham-33/job-scheduler` (merge commit `2998a28`). Go 1.27.3 is installed.
 - **The README in that merge commit still has its conflict markers.** The `<<<<<<< HEAD / ======= / >>>>>>>` lines are committed and pushed. GitHub's "Initial commit" added a one-line `# job-scheduler` README that clashed with the Phase 0 one.
 - **The Go module path is wrong.** It's `github.com/shambutn/job-scheduler`, but your GitHub username is `sham-33`. It's used in 6 places: `go.mod` and the imports in `cmd/worker/main.go`, `internal/store/store.go` and `internal/store/store_test.go`.
@@ -31,6 +32,7 @@ The goal is the project in this resume bullet:
 **Git rule:** Claude only runs read-only git commands (`status`, `diff`, `log`, `show`). It never runs `add`, `commit`, `push`, `merge`, `checkout`/`switch`, `branch`, `stash`, `reset` or `rebase`.
 
 **Redis while developing:**
+
 - **Phases 1–9:** Claude starts a temporary Homebrew `redis-server` in its scratchpad folder for tests and demos, then stops it. Docker isn't needed.
 - **Phases 10–12:** these need Docker Desktop running. Claude will ask you to start it.
 
@@ -61,25 +63,27 @@ The goal is the project in this resume bullet:
 `any non-terminal state → cancelled`
 
 **Redis keys**
-| Key | Type | Purpose |
-|---|---|---|
-| `job:{id}` | HASH | id, type, payload, status, attempts, max_attempts, run_at, timeout_ms, idem_key, lease_owner, lease_token, last_error, created/updated_at |
-| `jobs:scheduled` | ZSET score=run_at ms | delayed jobs and retries waiting for backoff |
-| `jobs:ready` | ZSET score=ready_at ms | runnable now (FIFO by score) |
-| `jobs:leases` | ZSET score=lease_expiry ms | running jobs. The reaper scans for expired leases |
-| `jobs:dlq` | ZSET score=died_at | dead-letter queue |
-| `idem:{key}` | STRING (TTL 24h) | maps an idempotency key to a job id |
-| `lease:token` | STRING (INCR) | monotonically increasing fencing token |
-| `scheduler:leader` / `scheduler:epoch` | STRING PX / INCR | leader lease and leadership epoch |
-| `cron:{name}` / `crons` | HASH / SET | cron definitions |
-| `cron:fired:{name}:{ts}` | STRING NX TTL | dedupe for each cron fire |
-| `workers` | ZSET score=last_seen | worker registry |
-| `stats` | HASH | counters: submitted, succeeded, retried, dead, reclaimed… |
-| `events` | STREAM (MAXLEN ~10k) | lifecycle events, used by the dashboard and to measure recovery time |
+
+| Key                                    | Type                       | Purpose                                                                                                                                   |
+| -------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `job:{id}`                             | HASH                       | id, type, payload, status, attempts, max_attempts, run_at, timeout_ms, idem_key, lease_owner, lease_token, last_error, created/updated_at |
+| `jobs:scheduled`                       | ZSET score=run_at ms       | delayed jobs and retries waiting for backoff                                                                                              |
+| `jobs:ready`                           | ZSET score=ready_at ms     | runnable now (FIFO by score)                                                                                                              |
+| `jobs:leases`                          | ZSET score=lease_expiry ms | running jobs. The reaper scans for expired leases                                                                                         |
+| `jobs:dlq`                             | ZSET score=died_at         | dead-letter queue                                                                                                                         |
+| `idem:{key}`                           | STRING (TTL 24h)           | maps an idempotency key to a job id                                                                                                       |
+| `lease:token`                          | STRING (INCR)              | monotonically increasing fencing token                                                                                                    |
+| `scheduler:leader` / `scheduler:epoch` | STRING PX / INCR           | leader lease and leadership epoch                                                                                                         |
+| `cron:{name}` / `crons`                | HASH / SET                 | cron definitions                                                                                                                          |
+| `cron:fired:{name}:{ts}`               | STRING NX TTL              | dedupe for each cron fire                                                                                                                 |
+| `workers`                              | ZSET score=last_seen       | worker registry                                                                                                                           |
+| `stats`                                | HASH                       | counters: submitted, succeeded, retried, dead, reclaimed…                                                                                 |
+| `events`                               | STREAM (MAXLEN ~10k)       | lifecycle events, used by the dashboard and to measure recovery time                                                                      |
 
 All timestamps inside scripts come from `redis.call('TIME')`, so every node agrees on the clock.
 
 **Layout**
+
 ```
 cmd/{api,scheduler,worker,jobctl,loadgen,chaos}/
 internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard,events}/
@@ -92,6 +96,7 @@ docs/{design.md,results.md,interview.md}
 Every key name comes from `store.Keys`, which adds an optional prefix. Production uses no prefix. Each test gets a random prefix, so test packages can run in parallel against one Redis.
 
 **Reuse from Phase 0:**
+
 - `config.Load()` ([internal/config/config.go](internal/config/config.go)) already has `Concurrency`, `LeaseTTL`, `HeartbeatEvery`, `ReapEvery` and `HTTPAddr`.
 - `store.Connect()` ([internal/store/store.go](internal/store/store.go)).
 - `logging.New()` ([internal/logging/logging.go](internal/logging/logging.go)).
@@ -111,24 +116,25 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 ## Phase 1: Housekeeping, the job model, enqueue, and a single worker ✅ done
 
 **As built, differences from the steps below:**
+
 - The Lua scripts live in `internal/queue/scripts/`, not `internal/store/`.
 - `scripts/lib.lua` provides a shared `now_ms()` and is prepended to every script.
 - The handlers live in `internal/handlers/`.
 - A failed job stays `running` until Phases 3 and 4 add the reaper and retries.
 
 **Housekeeping first:**
+
 1. Fix `README.md`. Drop the conflict markers and GitHub's one-line `# job-scheduler` heading, and keep the full Phase 0 README.
 2. Change the module path to `github.com/sham-33/job-scheduler`: run `go mod edit -module` and update the 3 Go files that import it.
 3. Replace `PLAN.md` in the repo with this plan.
 
-**Then build:**
-4. `internal/job`: the `Job` struct, `Status` constants, and conversion to and from a Redis hash.
-5. `internal/store`: key-name helpers, plus embedded Lua scripts loaded with `redis.NewScript`.
-6. `enqueue.lua`, all in one atomic step:
-   - **Idempotency check:** if the `idem:{key}` mapping exists, return the existing job id.
-   - Otherwise `HSET job:{id}`, then ZADD to `jobs:ready` (if due) or `jobs:scheduled` (if delayed).
-   - Bump `stats`.
-   - Doing all of this in one script means a crash can never leave an idempotency key pointing at a job that doesn't exist.
+**Then build:** 4. `internal/job`: the `Job` struct, `Status` constants, and conversion to and from a Redis hash. 5. `internal/store`: key-name helpers, plus embedded Lua scripts loaded with `redis.NewScript`. 6. `enqueue.lua`, all in one atomic step:
+
+- **Idempotency check:** if the `idem:{key}` mapping exists, return the existing job id.
+- Otherwise `HSET job:{id}`, then ZADD to `jobs:ready` (if due) or `jobs:scheduled` (if delayed).
+- Bump `stats`.
+- Doing all of this in one script means a crash can never leave an idempotency key pointing at a job that doesn't exist.
+
 7. `claim.lua`:
    - `ZPOPMIN jobs:ready`, skipping any job whose status isn't `ready`.
    - `INCR lease:token` for the fencing token.
@@ -140,13 +146,25 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 11. A temporary promoter goroutine inside the worker moves due jobs from `scheduled` to `ready` (`promote.lua`). Phase 5 moves it to the scheduler.
 
 **Done when:**
+
 - An immediate job and a job delayed by 5 s both run, at the right times.
 - Submitting twice with the same idempotency key returns the same id.
 - Integration tests cover each script.
 
 ---
 
-## Phase 2: Concurrency, 25 workers
+## Phase 2: Concurrency, 25 workers ✅ done
+
+**As built:**
+
+- `worker.Pool` replaces the single `Worker`. Each goroutine is a slot, and `lease_owner` is `<node>/<slot>`.
+- The go-redis pool size is `2 × CONCURRENCY + 4`: a claim or completion plus a heartbeat per slot, and a few background loops.
+
+**Measured:**
+
+- 10,000 jobs on 25 slots: 0 duplicates, about 15,000 jobs/s with no-op handlers under `-race`.
+- With a naive multi-command claim swapped in, the same test fails: 9,219 of 10,000 jobs ran more than once.
+- 100 jobs × 50 ms took 5,153 ms at `CONCURRENCY=1` and 206 ms at `CONCURRENCY=25`.
 
 1. `worker.Pool` runs `CONCURRENCY` goroutines. When the queue is empty, each backs off with jitter (10 ms up to 200 ms).
 2. Panics inside handlers are recovered and turned into errors.
@@ -164,6 +182,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 3. Graceful shutdown: stop claiming, wait for a grace period, then exit. Any leases left behind expire.
 
 **Done when:**
+
 - `kill -9` on a worker mid-job leads to the job being re-claimed in **under 2 s**. Claude measures and reports the time.
 - **Zombie test:** a worker paused with `kill -STOP` past its lease, then resumed, has its completion **rejected**.
 
@@ -224,6 +243,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 ## Phase 8: HTTP API and CLI
 
 **API** (`net/http` with Go 1.22+ routing):
+
 - `POST /jobs` (supports the `Idempotency-Key` header), `GET /jobs/{id}`, `DELETE /jobs/{id}`.
 - `GET /dlq`, `POST /dlq/{id}/replay`, `DELETE /dlq`.
 - `POST|GET /crons`, `DELETE|PATCH /crons/{name}`.
@@ -261,6 +281,7 @@ Panels: leader and epoch, live workers, queue depths, counters and throughput, a
 ## Phase 11: Load test, 100K+ jobs
 
 `cmd/loadgen`:
+
 - Pipelined submission of 100K jobs. The mix is about 70% immediate, 20% delayed (0–60 s), and 10% `flaky p=0.2`, with `sleep` durations of 5–50 ms.
 - Reports throughput, latency p50/p95/p99, counts, and the completion rate.
 - Writes the results to `docs/results.md`.
@@ -273,12 +294,14 @@ Panels: leader and epoch, live workers, queue depths, counters and throughput, a
 ## Phase 12: Fault injection, proving 99%+ and <2s
 
 `cmd/chaos` runs during loadgen:
+
 - `docker kill` a random worker every 5–15 s, then restart it.
 - Kill the leader every 30 s.
 - `docker pause` / `docker unpause` a worker (the zombie case).
 - Optionally restart Redis.
 
 **Measured from `events`:**
+
 - Recovery time p50/p99/max (target under 2 s).
 - Completion reliability, `succeeded / (submitted − intentional permanent failures)`, with the raw counts shown alongside.
 - Duplicate completions, which must be 0.
