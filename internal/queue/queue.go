@@ -38,11 +38,17 @@ var (
 	claimSrc string
 	//go:embed scripts/complete.lua
 	completeSrc string
+	//go:embed scripts/heartbeat.lua
+	heartbeatSrc string
+	//go:embed scripts/reap.lua
+	reapSrc string
 
-	enqueueScript  = newScript(enqueueSrc)
-	promoteScript  = newScript(promoteSrc)
-	claimScript    = newScript(claimSrc)
-	completeScript = newScript(completeSrc)
+	enqueueScript   = newScript(enqueueSrc)
+	promoteScript   = newScript(promoteSrc)
+	claimScript     = newScript(claimSrc)
+	completeScript  = newScript(completeSrc)
+	heartbeatScript = newScript(heartbeatSrc)
+	reapScript      = newScript(reapSrc)
 )
 
 // newScript prepends the shared helpers. go-redis sends the script's SHA
@@ -61,6 +67,11 @@ type Queue struct {
 // New returns a Queue whose claims lease a job for leaseTTL.
 func New(rdb *redis.Client, keys store.Keys, leaseTTL time.Duration) *Queue {
 	return &Queue{rdb: rdb, keys: keys, leaseTTL: leaseTTL}
+}
+
+// LeaseTTL is how long a claim or heartbeat keeps a job leased.
+func (q *Queue) LeaseTTL() time.Duration {
+	return q.leaseTTL
 }
 
 // Spec describes a job to enqueue.
@@ -158,6 +169,33 @@ func (q *Queue) Complete(ctx context.Context, j *job.Job) error {
 		return ErrLeaseLost
 	}
 	return nil
+}
+
+// Heartbeat renews the lease on a claimed job. It returns ErrLeaseLost if j's
+// fencing token is no longer the job's current one, which means the worker
+// must stop because another worker may already be running the job.
+func (q *Queue) Heartbeat(ctx context.Context, j *job.Job) error {
+	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Stats()}
+	ok, err := heartbeatScript.Run(ctx, q.rdb, keys, j.ID, j.LeaseToken, q.leaseTTL.Milliseconds()).Int()
+	if err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	if ok == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// Reap makes up to limit jobs with expired leases claimable again and returns
+// how many it reclaimed.
+func (q *Queue) Reap(ctx context.Context, limit int) (int, error) {
+	n, err := reapScript.Run(ctx, q.rdb, []string{q.keys.Leases(), q.keys.Ready(), q.keys.Stats()},
+		q.keys.JobPrefix(), limit,
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("reap: %w", err)
+	}
+	return n, nil
 }
 
 // Get returns the job with the given ID, or ErrNotFound.

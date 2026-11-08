@@ -16,6 +16,7 @@ func TestFromHash(t *testing.T) {
 		"idem_key":    "order-42",
 		"lease_owner": "worker-1",
 		"lease_token": "17",
+		"last_error":  "lease expired",
 		"run_at":      "1700000000000",
 		"created_at":  "1699999999000",
 		"updated_at":  "1700000000500",
@@ -25,7 +26,7 @@ func TestFromHash(t *testing.T) {
 		t.Fatalf("FromHash: %v", err)
 	}
 	if j.ID != "j1" || j.Type != "echo" || j.Status != StatusRunning || j.Attempts != 2 ||
-		j.IdempotencyKey != "order-42" || j.LeaseOwner != "worker-1" || j.LeaseToken != 17 {
+		j.IdempotencyKey != "order-42" || j.LeaseOwner != "worker-1" || j.LeaseToken != 17 || j.LastError != "lease expired" {
 		t.Errorf("FromHash fields = %+v", j)
 	}
 	if string(j.Payload) != `{"msg":"hi"}` {

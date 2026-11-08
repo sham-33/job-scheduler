@@ -8,6 +8,7 @@
 
 local status, token = unpack(redis.call('HMGET', KEYS[1], 'status', 'lease_token'))
 if status ~= 'running' or token ~= ARGV[2] then
+  redis.call('HINCRBY', KEYS[3], 'fenced', 1)
   return 0
 end
 

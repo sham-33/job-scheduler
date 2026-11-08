@@ -36,6 +36,9 @@ type Config struct {
 	HeartbeatEvery time.Duration
 	// ReapEvery is how often the scheduler looks for expired leases.
 	ReapEvery time.Duration
+	// ShutdownGrace is how long running jobs get to finish after a worker is
+	// told to stop. Zero cancels them immediately.
+	ShutdownGrace time.Duration
 }
 
 // Load reads the environment, applies defaults and validates the result.
@@ -53,6 +56,7 @@ func Load() (Config, error) {
 		LeaseTTL:       e.duration("LEASE_TTL", 1500*time.Millisecond),
 		HeartbeatEvery: e.duration("HEARTBEAT_EVERY", 500*time.Millisecond),
 		ReapEvery:      e.duration("REAP_EVERY", 200*time.Millisecond),
+		ShutdownGrace:  e.duration("SHUTDOWN_GRACE", 5*time.Second),
 	}
 	if err := errors.Join(append(e.errs, cfg.validate()...)...); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
@@ -76,6 +80,9 @@ func (c Config) validate() []error {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
 		}
+	}
+	if c.ShutdownGrace < 0 {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE must not be negative, got %s", c.ShutdownGrace))
 	}
 	// A lease has to survive one missed heartbeat, or a single slow Redis
 	// round trip would make a healthy worker lose its job.

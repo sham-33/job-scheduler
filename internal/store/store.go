@@ -33,6 +33,10 @@ func Connect(ctx context.Context, cfg config.Config) (*redis.Client, error) {
 		Password: cfg.RedisPassword,
 		DB:       cfg.RedisDB,
 		PoolSize: poolSize(cfg.Concurrency),
+		// Without this, go-redis ignores context deadlines on network reads
+		// and waits out its own 3s timeout. That is longer than a lease, so a
+		// worker couldn't notice in time that Redis had stopped answering.
+		ContextTimeoutEnabled: true,
 	})
 
 	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
