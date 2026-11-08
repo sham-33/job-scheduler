@@ -6,7 +6,7 @@ The goal is the project in this resume bullet:
 
 > Fault-tolerant distributed job scheduler in Go + Redis. 25 concurrent workers, 100K+ scheduled jobs under load. Leader election, distributed leases, idempotent job claims, retries, dead-letter queues. 99%+ completion reliability, <2s worker-failure recovery in fault-injection tests.
 
-**Change of approach:** Claude now implements the whole project (code, tests, running it, verifying it). You handle **all git work**: branches, commits, pushes and merges. Extras in scope: **HTTP API + CLI**, **cron schedules**, **web dashboard**.
+**Change of approach:** Claude now implements the whole project (code, tests, running it, verifying it). You handle **all git work**: branches, commits, pushes and merges. Extras in scope: **HTTP API + CLI**, **cron schedules**, **web dashboard**, **`http` job type**.
 
 **Current state**
 
@@ -88,7 +88,7 @@ All timestamps inside scripts come from `redis.call('TIME')`, so every node agre
 cmd/{api,scheduler,worker,jobctl,loadgen,chaos}/
 internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard,events}/
 internal/queue/scripts/*.lua   (embedded with go:embed, next to the Go code that calls them)
-internal/handlers/             (example job types: sleep, echo, flaky)
+internal/handlers/             (job types: sleep, echo, flaky, http)
 internal/store/storetest/      (test helper: real Redis on DB 15 plus a key prefix per test)
 docs/{PLAN.md,design.md,results.md,interview.md}
 ```
@@ -204,7 +204,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 4: Retries, backoff, timeouts, DLQ, and cancel
+## Phase 4: Retries, backoff, timeouts, DLQ, cancel, and the `http` job type
 
 1. Spec fields: `MaxAttempts` (default 5), `TimeoutMs`, `Backoff{Base, Max}`.
 2. Backoff is computed in Go (`min(max, base*2^attempt) + jitter`) and passed into Lua. It has unit tests.
@@ -213,8 +213,17 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 5. `job.Permanent(err)` skips retries and goes straight to the DLQ.
 6. `cancel.lua` and `replay.lua`.
 7. A `flaky` handler with failure probability `p`.
+8. An `http` job type, so people can schedule their own work without writing Go or changing the worker. The payload is `{url, method, headers, body}`, and `method` defaults to `POST`. The worker calls the address and adds `X-Job-Id` and `X-Job-Attempt` headers, so the receiver can spot a repeat:
+   - A 2xx reply means the job succeeded.
+   - A 5xx, 408 or 429 reply, a network error, or a timeout means retry with backoff.
+   - Any other reply is `job.Permanent`, straight to the DLQ.
 
-**Done when:** `flaky p=0.5` succeeds after retries with growing delays, and an always-failing job reaches the DLQ after 5 attempts and can be replayed.
+**Done when:**
+
+- `flaky p=0.5` succeeds after retries with growing delays, and an always-failing job reaches the DLQ after 5 attempts and can be replayed.
+- `http` jobs against a fake test server end correctly for each reply: 200 succeeds, 500 retries and succeeds once the server recovers, a server that never answers times out and retries, and 400 goes straight to the DLQ.
+
+**Key concept:** why a scheduler calls the user's code instead of running it.
 
 ---
 
@@ -268,7 +277,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 Add a `run-api` Makefile target.
 
-**Done when:** `httptest` handler tests pass, and a `jobctl` smoke test against a running stack exercises every feature.
+**Done when:** `httptest` handler tests pass, and a `jobctl` smoke test against a running stack exercises every feature, including a delayed `http` job that calls a small local server.
 
 ---
 
@@ -278,7 +287,7 @@ A static HTML page with vanilla JS, embedded in the API and served at `/`. It po
 
 Panels: leader and epoch, live workers, queue depths, counters and throughput, a recent events feed, a DLQ table with Replay buttons, and a cron list with enable/disable.
 
-**Done when:** Claude opens `http://localhost:8080` in the browser pane, kills a worker, and confirms it turns red while a `reclaimed` event appears. Claude shares a screenshot.
+**Done when:** Claude opens `http://localhost:8080` in the browser pane, runs `http` jobs against a small local server, kills a worker, and confirms it turns red while a `reclaimed` event appears. Claude shares a screenshot.
 
 ---
 
@@ -332,6 +341,7 @@ Panels: leader and epoch, live workers, queue depths, counters and throughput, a
   - Each Lua script.
   - Delivery semantics: delivery is at-least-once, and you get effectively-once results through fencing plus idempotent handlers.
   - Tradeoffs: Redis is a single point of failure (mitigations: Sentinel or Cluster, plus `{jobs}` hash tags) and the choice of lease TTL.
+  - What the `http` job type leaves out that a hosted product would need: signed requests, so receivers can trust them, and blocking calls to internal addresses (SSRF).
 - `.github/workflows/ci.yml`: `go vet` and `go test -race` with a Redis service container. You push it.
 - `docs/interview.md`: written answers to:
   - Why Lua instead of `MULTI`/`WATCH`?
@@ -339,6 +349,7 @@ Panels: leader and epoch, live workers, queue depths, counters and throughput, a
   - What if two leaders exist for a moment?
   - How would you make Redis highly available?
   - Why ZSET over LIST or Streams?
+  - How would other teams use this without changing your code?
 
 ---
 
