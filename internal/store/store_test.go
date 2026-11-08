@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sham-33/job-scheduler/internal/config"
 )
@@ -42,6 +44,36 @@ func TestConnect(t *testing.T) {
 	}
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		t.Errorf("Ping after Connect: %v", err)
+	}
+}
+
+// A server that accepts connections and then says nothing is what a hung
+// Redis looks like. The caller's deadline has to win over go-redis's own 3s
+// timeout, or a worker couldn't notice in time that its lease is at risk.
+func TestConnectHonorsContextDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := Connect(ctx, config.Config{RedisAddr: ln.Addr().String()}); err == nil {
+		t.Fatal("Connect succeeded against a silent server, want error")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("Connect took %s to give up, want about the 100ms deadline", took)
 	}
 }
 

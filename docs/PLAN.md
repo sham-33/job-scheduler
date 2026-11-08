@@ -90,18 +90,18 @@ internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard
 internal/queue/scripts/*.lua   (embedded with go:embed, next to the Go code that calls them)
 internal/handlers/             (example job types: sleep, echo, flaky)
 internal/store/storetest/      (test helper: real Redis on DB 15 plus a key prefix per test)
-docs/{design.md,results.md,interview.md}
+docs/{PLAN.md,design.md,results.md,interview.md}
 ```
 
 Every key name comes from `store.Keys`, which adds an optional prefix. Production uses no prefix. Each test gets a random prefix, so test packages can run in parallel against one Redis.
 
 **Reuse from Phase 0:**
 
-- `config.Load()` ([internal/config/config.go](internal/config/config.go)) already has `Concurrency`, `LeaseTTL`, `HeartbeatEvery`, `ReapEvery` and `HTTPAddr`.
-- `store.Connect()` ([internal/store/store.go](internal/store/store.go)).
-- `logging.New()` ([internal/logging/logging.go](internal/logging/logging.go)).
-- The `signal.NotifyContext` shutdown pattern in [cmd/worker/main.go](cmd/worker/main.go).
-- `storetest.Client(t)` and `storetest.Keys(t, rdb)` ([internal/store/storetest](internal/store/storetest/storetest.go)) for every Redis integration test.
+- `config.Load()` ([internal/config/config.go](../internal/config/config.go)) already has `Concurrency`, `LeaseTTL`, `HeartbeatEvery`, `ReapEvery` and `HTTPAddr`.
+- `store.Connect()` ([internal/store/store.go](../internal/store/store.go)).
+- `logging.New()` ([internal/logging/logging.go](../internal/logging/logging.go)).
+- The `signal.NotifyContext` shutdown pattern in [cmd/worker/main.go](../cmd/worker/main.go).
+- `storetest.Client(t)` and `storetest.Keys(t, rdb)` ([internal/store/storetest](../internal/store/storetest/storetest.go)) for every Redis integration test.
 
 **Dependencies to add when needed:** `github.com/robfig/cron/v3` (Phase 6), `github.com/spf13/cobra` (Phase 8). `github.com/google/uuid` was added in Phase 1.
 
@@ -175,7 +175,21 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 3: Leases, heartbeats, fencing, and the reaper
+## Phase 3: Leases, heartbeats, fencing, and the reaper ✅ done
+
+**As built:**
+
+- A reclaimed job goes straight back to `jobs:ready` with its original `run_at` as the score, so it runs ahead of newer work. There is no backoff, which is what keeps recovery under 2 s.
+- `stats.reclaimed` and `stats.fenced` count takeovers and rejected calls from stale workers. The `events` stream arrives in Phase 7.
+- A worker that can't reach Redis for a whole lease cancels its job, because it has to assume the job was handed to someone else.
+- `ContextTimeoutEnabled` is on for go-redis. Without it, a call to a hung Redis blocks for 3 s, longer than a lease.
+- New setting: `SHUTDOWN_GRACE` (default 5 s).
+
+**Measured with real processes, default settings:**
+
+- `kill -9` mid-job, 30 trials on an idle cluster: min 1,116 ms, p50 1,341 ms, p95 1,526 ms, max 1,568 ms. All 30 were under 2 s.
+- Frozen worker woken after takeover: its completion was rejected, with 1 success recorded and `fenced=1`.
+- 9 deliberate code breaks in a throwaway copy were all caught by the tests.
 
 1. `heartbeat.lua`: if the token matches, run `ZADD jobs:leases XX now+TTL`. If it doesn't, return "lost". Each running job gets a heartbeat goroutine (`HeartbeatEvery`). Losing the lease **cancels the job's context**.
 2. `reap.lua`: find expired leases and treat each as a failed attempt with reason `lease_expired`. Emit a `reclaimed` event. For now it runs inside the worker process; Phase 5 moves it to the scheduler.
@@ -194,7 +208,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 1. Spec fields: `MaxAttempts` (default 5), `TimeoutMs`, `Backoff{Base, Max}`.
 2. Backoff is computed in Go (`min(max, base*2^attempt) + jitter`) and passed into Lua. It has unit tests.
-3. `fail.lua` (token-checked): either a retry (back into `jobs:scheduled`) or dead (into `jobs:dlq`). `reap.lua` shares this logic.
+3. `fail.lua` (token-checked): either a retry (back into `jobs:scheduled`) or dead (into `jobs:dlq`). `reap.lua` gets the same attempts cap, but keeps requeueing immediately with no backoff, so worker-failure recovery stays under 2 s.
 4. Per-job timeouts with `context.WithTimeout`.
 5. `job.Permanent(err)` skips retries and goes straight to the DLQ.
 6. `cancel.lua` and `replay.lua`.

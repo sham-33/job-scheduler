@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -20,20 +21,37 @@ import (
 
 func newQueue(t *testing.T) (*queue.Queue, *redis.Client, store.Keys) {
 	t.Helper()
-	rdb := storetest.Client(t)
-	keys := storetest.Keys(t, rdb)
-	return queue.New(rdb, keys, 2*time.Second), rdb, keys
+	return newQueueWithLease(t, 2*time.Second)
 }
 
-// startPool runs a pool and the promoter until stop is called or the test
-// ends. stop waits for every slot to finish.
+func newQueueWithLease(t *testing.T, lease time.Duration) (*queue.Queue, *redis.Client, store.Keys) {
+	t.Helper()
+	rdb := storetest.Client(t)
+	keys := storetest.Keys(t, rdb)
+	return queue.New(rdb, keys, lease), rdb, keys
+}
+
+// startPool runs a pool with default options until stop is called or the
+// test ends.
 func startPool(t *testing.T, q *queue.Queue, concurrency int, handlers worker.Handlers) (stop func()) {
 	t.Helper()
+	return startPoolWith(t, q, worker.Options{Concurrency: concurrency, ShutdownGrace: time.Second}, handlers)
+}
+
+// startPoolWith runs a pool, the promoter and the reaper until stop is
+// called or the test ends. stop waits for the pool to shut down.
+func startPoolWith(t *testing.T, q *queue.Queue, opts worker.Options, handlers worker.Handlers) (stop func()) {
+	t.Helper()
+	opts.ID = "test"
+	if opts.HeartbeatEvery == 0 {
+		opts.HeartbeatEvery = q.LeaseTTL() / 4
+	}
 	logger := slog.New(slog.DiscardHandler)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Go(func() { worker.NewPool("test", concurrency, q, handlers, logger).Run(ctx) })
+	wg.Go(func() { worker.NewPool(opts, q, handlers, logger).Run(ctx) })
 	wg.Go(func() { scheduler.RunPromoter(ctx, q, logger) })
+	wg.Go(func() { scheduler.RunReaper(ctx, q, 20*time.Millisecond, logger) })
 	stop = sync.OnceFunc(func() {
 		cancel()
 		wg.Wait()
@@ -53,7 +71,12 @@ func mustEnqueue(t *testing.T, q *queue.Queue, s queue.Spec) string {
 
 func waitStatus(t *testing.T, q *queue.Queue, id string, want job.Status) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	waitStatusWithin(t, q, id, want, 2*time.Second)
+}
+
+func waitStatusWithin(t *testing.T, q *queue.Queue, id string, want job.Status, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for {
 		j, err := q.Get(context.Background(), id)
 		if err == nil && j.Status == want {
@@ -205,6 +228,11 @@ func TestPoolRunsEveryJobExactlyOnce(t *testing.T) {
 			t.Errorf("stats.%s = %s, want %s", name, got, want)
 		}
 	}
+	for _, name := range []string{"reclaimed", "fenced"} {
+		if got := stats[name]; got != "" {
+			t.Errorf("stats.%s = %s, want none on a healthy run", name, got)
+		}
+	}
 	for _, key := range []string{keys.Ready(), keys.Scheduled(), keys.Leases()} {
 		if n := rdb.ZCard(ctx, key).Val(); n != 0 {
 			t.Errorf("%s still holds %d entries, want 0", key, n)
@@ -336,17 +364,228 @@ func TestPoolSurvivesHandlerPanic(t *testing.T) {
 	waitStatus(t, q, bad, job.StatusRunning)
 }
 
-func TestPoolLeavesFailedJobRunning(t *testing.T) {
-	q, _, _ := newQueue(t)
-	startPool(t, q, 1, nil)
-	id := mustEnqueue(t, q, queue.Spec{Type: "no-such-type"})
+// Until retries exist (Phase 4), a failed job's lease simply expires and the
+// reaper hands it out again.
+func TestPoolRunsFailedJobAgainAfterLeaseExpires(t *testing.T) {
+	q, _, _ := newQueueWithLease(t, 100*time.Millisecond)
+	startPool(t, q, 1, worker.Handlers{
+		"fail": func(context.Context, *job.Job) error { return errors.New("nope") },
+	})
+	id := mustEnqueue(t, q, queue.Spec{Type: "fail"})
 
-	// Until retries exist (Phase 4), a failed job keeps its lease and stays
-	// running so the reaper (Phase 3) can hand it to another worker.
-	waitStatus(t, q, id, job.StatusRunning)
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		j, err := q.Get(context.Background(), id)
+		if err == nil && j.Attempts >= 3 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job = %+v (err %v), want at least 3 attempts", j, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A job can run far longer than its lease, as long as the heartbeat renews it.
+func TestPoolHeartbeatKeepsLongJobAlive(t *testing.T) {
+	const lease = 200 * time.Millisecond
+	q, rdb, keys := newQueueWithLease(t, lease)
+	var runs atomic.Int32
+	startPool(t, q, 1, worker.Handlers{
+		"long": func(context.Context, *job.Job) error {
+			runs.Add(1)
+			time.Sleep(4 * lease)
+			return nil
+		},
+	})
+	id := mustEnqueue(t, q, queue.Spec{Type: "long"})
+
+	waitStatusWithin(t, q, id, job.StatusSucceeded, 4*lease+2*time.Second)
+	if got := runs.Load(); got != 1 {
+		t.Errorf("handler ran %d times, want 1", got)
+	}
+	if j, _ := q.Get(context.Background(), id); j.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", j.Attempts)
+	}
+	stats := rdb.HGetAll(context.Background(), keys.Stats()).Val()
+	if stats["reclaimed"] != "" || stats["fenced"] != "" {
+		t.Errorf("stats = %v, want nothing reclaimed or fenced", stats)
+	}
+}
+
+// A worker that dies never heartbeats again, which is exactly what claiming
+// a job directly and then ignoring it looks like.
+func TestPoolPicksUpJobFromCrashedWorker(t *testing.T) {
+	const lease = 300 * time.Millisecond
+	q, _, _ := newQueueWithLease(t, lease)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, queue.Spec{Type: "record"})
+	crashed, err := q.Claim(ctx, "crashed-worker")
+	if err != nil || crashed == nil {
+		t.Fatalf("Claim = (%v, %v)", crashed, err)
+	}
+	claimed := time.Now()
+
+	runs := make(chan run, 1)
+	startPool(t, q, 1, worker.Handlers{"record": recorder(runs)})
+
+	got := waitRun(t, runs, lease+2*time.Second)
+	recovery := got.at.Sub(claimed)
+	t.Logf("job re-ran %s after its worker's last heartbeat (lease %s)", recovery, lease)
+	if recovery < lease-5*time.Millisecond {
+		t.Errorf("job re-ran after %s, before its %s lease could expire", recovery, lease)
+	}
+	if recovery > lease+500*time.Millisecond {
+		t.Errorf("job re-ran after %s, want within 500ms of the %s lease", recovery, lease)
+	}
+
+	waitStatus(t, q, id, job.StatusSucceeded)
+	j, _ := q.Get(ctx, id)
+	if j.Attempts != 2 || j.LeaseOwner == crashed.LeaseOwner {
+		t.Errorf("job = %+v, want attempt 2 under a new owner", j)
+	}
+	if err := q.Complete(ctx, crashed); !errors.Is(err, queue.ErrLeaseLost) {
+		t.Errorf("crashed worker's Complete = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestPoolCancelsHandlerWhenLeaseIsLost(t *testing.T) {
+	q, rdb, keys := newQueueWithLease(t, 200*time.Millisecond)
+	ctx := context.Background()
+	started := make(chan *job.Job, 8)
+	causes := make(chan error, 8)
+	startPoolWith(t, q, worker.Options{Concurrency: 1}, worker.Handlers{
+		"block": func(ctx context.Context, j *job.Job) error {
+			started <- j
+			<-ctx.Done()
+			causes <- context.Cause(ctx)
+			return ctx.Err()
+		},
+	})
+	id := mustEnqueue(t, q, queue.Spec{Type: "block"})
+
+	var j *job.Job
+	select {
+	case j = <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	// Another worker taking over shows up as a newer fencing token.
+	rdb.HSet(ctx, keys.Job(id), "lease_token", j.LeaseToken+1000)
+
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, queue.ErrLeaseLost) {
+			t.Errorf("handler cancelled with cause %v, want ErrLeaseLost", cause)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was not cancelled after losing its lease")
+	}
+	if got, _ := q.Get(ctx, id); got.Status == job.StatusSucceeded {
+		t.Error("job was marked succeeded by a worker that lost its lease")
+	}
+}
+
+func TestPoolFinishesRunningJobsOnShutdown(t *testing.T) {
+	q, _, _ := newQueue(t)
+	ctx := context.Background()
+	started := make(chan struct{}, 2)
+	stop := startPoolWith(t, q, worker.Options{Concurrency: 1, ShutdownGrace: 5 * time.Second}, worker.Handlers{
+		"work": func(ctx context.Context, _ *job.Job) error {
+			started <- struct{}{}
+			select {
+			case <-time.After(300 * time.Millisecond):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	running := mustEnqueue(t, q, queue.Spec{Type: "work"})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+	waiting := mustEnqueue(t, q, queue.Spec{Type: "work"})
+
+	stop()
+
+	if j, _ := q.Get(ctx, running); j.Status != job.StatusSucceeded {
+		t.Errorf("running job has status %s after shutdown, want succeeded", j.Status)
+	}
+	if j, _ := q.Get(ctx, waiting); j.Status != job.StatusReady || j.Attempts != 0 {
+		t.Errorf("waiting job = %+v, want it left ready for another worker", j)
+	}
+}
+
+func TestPoolCancelsJobsWhenGraceRunsOut(t *testing.T) {
+	const grace = 100 * time.Millisecond
+	q, _, _ := newQueue(t)
+	started := make(chan struct{}, 1)
+	cancelled := make(chan struct{}, 1)
+	stop := startPoolWith(t, q, worker.Options{Concurrency: 1, ShutdownGrace: grace}, worker.Handlers{
+		"block": func(ctx context.Context, _ *job.Job) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			cancelled <- struct{}{}
+			return ctx.Err()
+		},
+	})
+	id := mustEnqueue(t, q, queue.Spec{Type: "block"})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	begin := time.Now()
+	stop()
+	took := time.Since(begin)
+
+	select {
+	case <-cancelled:
+	default:
+		t.Error("handler was not cancelled")
+	}
+	if took < grace || took > grace+time.Second {
+		t.Errorf("shutdown took %s, want about the %s grace period", took, grace)
+	}
+	// It keeps its lease, so the reaper can hand it to another worker.
 	if j, _ := q.Get(context.Background(), id); j.Status != job.StatusRunning {
 		t.Errorf("Status = %s, want running", j.Status)
+	}
+}
+
+func TestPoolShutdownDoesNotWaitForeverOnStuckHandler(t *testing.T) {
+	q, _, _ := newQueue(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	stop := startPoolWith(t, q, worker.Options{Concurrency: 1, ShutdownGrace: 10 * time.Millisecond}, worker.Handlers{
+		"stuck": func(context.Context, *job.Job) error {
+			started <- struct{}{}
+			<-release // ignores cancellation
+			return nil
+		},
+	})
+	mustEnqueue(t, q, queue.Spec{Type: "stuck"})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown hung on a handler that ignores cancellation")
 	}
 }
 

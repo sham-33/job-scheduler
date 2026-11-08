@@ -40,6 +40,8 @@ type Job struct {
 	// LeaseToken is the fencing token from the latest claim. Only the holder
 	// of the current token may finish the job.
 	LeaseToken int64 `json:"lease_token,omitempty"`
+	// LastError says why the most recent attempt didn't succeed.
+	LastError string `json:"last_error,omitempty"`
 
 	// All times come from Redis's clock, not the caller's.
 	RunAt      time.Time `json:"run_at"`
@@ -64,6 +66,7 @@ func FromHash(h map[string]string) (*Job, error) {
 		IdempotencyKey: h["idem_key"],
 		LeaseOwner:     h["lease_owner"],
 		LeaseToken:     p.int("lease_token"),
+		LastError:      h["last_error"],
 		RunAt:          p.millis("run_at"),
 		CreatedAt:      p.millis("created_at"),
 		UpdatedAt:      p.millis("updated_at"),

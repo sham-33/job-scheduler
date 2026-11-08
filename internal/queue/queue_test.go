@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -344,5 +346,279 @@ func TestGetNotFound(t *testing.T) {
 	q, _, _ := newTestQueue(t)
 	if _, err := q.Get(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Get = %v, want ErrNotFound", err)
+	}
+}
+
+// leaseTestQueue returns a queue with a short lease, for tests that wait for
+// one to expire.
+func leaseTestQueue(t *testing.T, lease time.Duration) (*Queue, *redis.Client, store.Keys) {
+	t.Helper()
+	rdb := storetest.Client(t)
+	keys := storetest.Keys(t, rdb)
+	return New(rdb, keys, lease), rdb, keys
+}
+
+func TestHeartbeatExtendsLease(t *testing.T) {
+	q, rdb, keys := newTestQueue(t)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	j, _ := q.Claim(ctx, "w")
+	before, _ := inZSet(t, rdb, keys.Leases(), id)
+
+	time.Sleep(20 * time.Millisecond)
+	if err := q.Heartbeat(ctx, j); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	after, ok := inZSet(t, rdb, keys.Leases(), id)
+	if !ok {
+		t.Fatal("lease disappeared")
+	}
+	if after-before < 20 {
+		t.Errorf("lease moved by %vms, want at least 20ms", after-before)
+	}
+}
+
+func TestHeartbeatRejectsStaleToken(t *testing.T) {
+	q, rdb, keys := newTestQueue(t)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	j, _ := q.Claim(ctx, "w")
+	before, _ := inZSet(t, rdb, keys.Leases(), id)
+	rdb.HSet(ctx, keys.Job(id), "lease_token", j.LeaseToken+1)
+
+	time.Sleep(5 * time.Millisecond)
+	if err := q.Heartbeat(ctx, j); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Heartbeat with stale token = %v, want ErrLeaseLost", err)
+	}
+	if after, _ := inZSet(t, rdb, keys.Leases(), id); after != before {
+		t.Errorf("lease moved from %v to %v, want it untouched", before, after)
+	}
+	if got := stat(t, rdb, keys, "fenced"); got != 1 {
+		t.Errorf("stats.fenced = %d, want 1", got)
+	}
+}
+
+func TestHeartbeatRejectedOnceFinished(t *testing.T) {
+	q, rdb, keys := newTestQueue(t)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	j, _ := q.Claim(ctx, "w")
+	if err := q.Complete(ctx, j); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if err := q.Heartbeat(ctx, j); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Heartbeat after Complete = %v, want ErrLeaseLost", err)
+	}
+	if _, ok := inZSet(t, rdb, keys.Leases(), id); ok {
+		t.Error("heartbeat brought a finished job's lease back")
+	}
+}
+
+func TestReapReclaimsExpiredLease(t *testing.T) {
+	const lease = 50 * time.Millisecond
+	q, rdb, keys := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	dead, _ := q.Claim(ctx, "dead-worker")
+
+	if n, err := q.Reap(ctx, 100); err != nil || n != 0 {
+		t.Fatalf("Reap before expiry = (%d, %v), want (0, nil)", n, err)
+	}
+
+	time.Sleep(lease + 30*time.Millisecond)
+	if n, err := q.Reap(ctx, 100); err != nil || n != 1 {
+		t.Fatalf("Reap after expiry = (%d, %v), want (1, nil)", n, err)
+	}
+	j := mustGet(t, q, id)
+	if j.Status != job.StatusReady || j.Attempts != 1 || j.LastError != "lease expired" {
+		t.Errorf("job = %+v, want ready, 1 attempt so far, last error 'lease expired'", j)
+	}
+	if _, ok := inZSet(t, rdb, keys.Leases(), id); ok {
+		t.Error("expired lease was not removed")
+	}
+	if got := stat(t, rdb, keys, "reclaimed"); got != 1 {
+		t.Errorf("stats.reclaimed = %d, want 1", got)
+	}
+	if n, _ := q.Reap(ctx, 100); n != 0 {
+		t.Errorf("second Reap reclaimed %d, want 0", n)
+	}
+
+	next, err := q.Claim(ctx, "new-worker")
+	if err != nil || next == nil || next.ID != id {
+		t.Fatalf("Claim after Reap = (%v, %v), want job %s", next, err, id)
+	}
+	if next.Attempts != 2 || next.LeaseOwner != "new-worker" || next.LeaseToken <= dead.LeaseToken {
+		t.Errorf("re-claimed job = %+v, want attempt 2, new owner, a token above %d", next, dead.LeaseToken)
+	}
+}
+
+func TestReapSparesRenewedLease(t *testing.T) {
+	const lease = 150 * time.Millisecond
+	q, _, _ := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	j, _ := q.Claim(ctx, "w")
+
+	// Stay alive well past the original expiry by renewing in time.
+	for range 4 {
+		time.Sleep(lease / 3)
+		if err := q.Heartbeat(ctx, j); err != nil {
+			t.Fatalf("Heartbeat: %v", err)
+		}
+		if n, _ := q.Reap(ctx, 100); n != 0 {
+			t.Fatalf("Reap took a job whose lease was being renewed")
+		}
+	}
+	if got := mustGet(t, q, id).Status; got != job.StatusRunning {
+		t.Errorf("Status = %s, want running", got)
+	}
+}
+
+func TestReapRespectsLimit(t *testing.T) {
+	const lease = 30 * time.Millisecond
+	q, _, _ := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	for range 5 {
+		mustEnqueue(t, q, Spec{Type: "echo"})
+		q.Claim(ctx, "w")
+	}
+	time.Sleep(lease + 30*time.Millisecond)
+
+	if n, _ := q.Reap(ctx, 3); n != 3 {
+		t.Errorf("first Reap reclaimed %d, want 3", n)
+	}
+	if n, _ := q.Reap(ctx, 3); n != 2 {
+		t.Errorf("second Reap reclaimed %d, want 2", n)
+	}
+}
+
+func TestReapedJobGoesAheadOfNewerWork(t *testing.T) {
+	const lease = 30 * time.Millisecond
+	q, _, _ := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	old := mustEnqueue(t, q, Spec{Type: "echo"})
+	q.Claim(ctx, "dead-worker")
+	time.Sleep(lease + 30*time.Millisecond)
+	newer := mustEnqueue(t, q, Spec{Type: "echo"})
+	if n, _ := q.Reap(ctx, 100); n != 1 {
+		t.Fatalf("Reap reclaimed %d, want 1", n)
+	}
+
+	first, _ := q.Claim(ctx, "w")
+	if first == nil || first.ID != old {
+		t.Fatalf("first claim = %+v, want the reclaimed job %s ahead of %s", first, old, newer)
+	}
+}
+
+func TestReapOnlyDropsLeaseOfJobNoLongerRunning(t *testing.T) {
+	const lease = 30 * time.Millisecond
+	q, rdb, keys := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	q.Claim(ctx, "w")
+	rdb.HSet(ctx, keys.Job(id), "status", string(job.StatusCancelled))
+	time.Sleep(lease + 30*time.Millisecond)
+
+	if n, _ := q.Reap(ctx, 100); n != 0 {
+		t.Errorf("Reap reclaimed %d, want 0 for a job that isn't running", n)
+	}
+	if _, ok := inZSet(t, rdb, keys.Leases(), id); ok {
+		t.Error("stale lease was not removed")
+	}
+	if got := mustGet(t, q, id).Status; got != job.StatusCancelled {
+		t.Errorf("Status = %s, want cancelled to be left alone", got)
+	}
+}
+
+// Several schedulers can briefly run at once during a failover, so reaping
+// has to stay correct when it races with itself.
+func TestConcurrentReapersReclaimEachJobOnce(t *testing.T) {
+	const (
+		lease   = 30 * time.Millisecond
+		jobs    = 200
+		reapers = 10
+	)
+	q, rdb, keys := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	for range jobs {
+		mustEnqueue(t, q, Spec{Type: "echo"})
+		q.Claim(ctx, "w")
+	}
+	time.Sleep(lease + 30*time.Millisecond)
+
+	var total atomic.Int64
+	var wg sync.WaitGroup
+	for range reapers {
+		wg.Go(func() {
+			n, err := q.Reap(ctx, 7)
+			for err == nil && n > 0 {
+				total.Add(int64(n))
+				n, err = q.Reap(ctx, 7)
+			}
+			if err != nil {
+				t.Errorf("Reap: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if total.Load() != jobs {
+		t.Errorf("reapers reclaimed %d jobs in total, want %d", total.Load(), jobs)
+	}
+	if got := stat(t, rdb, keys, "reclaimed"); got != jobs {
+		t.Errorf("stats.reclaimed = %d, want %d", got, jobs)
+	}
+	if n := rdb.ZCard(ctx, keys.Ready()).Val(); n != jobs {
+		t.Errorf("ready set has %d jobs, want %d", n, jobs)
+	}
+}
+
+// A worker that freezes, loses its job and later wakes up must not be able
+// to renew the lease or record a result.
+func TestZombieCannotFinishAfterTakeover(t *testing.T) {
+	const lease = 30 * time.Millisecond
+	q, rdb, keys := leaseTestQueue(t, lease)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	zombie, _ := q.Claim(ctx, "zombie")
+
+	time.Sleep(lease + 30*time.Millisecond)
+	if n, _ := q.Reap(ctx, 100); n != 1 {
+		t.Fatalf("Reap reclaimed %d, want 1", n)
+	}
+
+	// Waking up before anyone has taken the job over.
+	if err := q.Complete(ctx, zombie); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Complete on a reclaimed job = %v, want ErrLeaseLost", err)
+	}
+	if got := mustGet(t, q, id).Status; got != job.StatusReady {
+		t.Fatalf("Status = %s, want ready", got)
+	}
+
+	// Waking up after another worker took the job over.
+	fresh, _ := q.Claim(ctx, "fresh")
+	if err := q.Heartbeat(ctx, zombie); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("zombie Heartbeat = %v, want ErrLeaseLost", err)
+	}
+	if err := q.Complete(ctx, zombie); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("zombie Complete = %v, want ErrLeaseLost", err)
+	}
+	j := mustGet(t, q, id)
+	if j.Status != job.StatusRunning || j.LeaseOwner != "fresh" {
+		t.Errorf("job = %+v, want it still running under fresh", j)
+	}
+
+	if err := q.Heartbeat(ctx, fresh); err != nil {
+		t.Errorf("fresh Heartbeat: %v", err)
+	}
+	if err := q.Complete(ctx, fresh); err != nil {
+		t.Errorf("fresh Complete: %v", err)
+	}
+	if got := stat(t, rdb, keys, "succeeded"); got != 1 {
+		t.Errorf("stats.succeeded = %d, want 1", got)
+	}
+	if got := stat(t, rdb, keys, "fenced"); got != 3 {
+		t.Errorf("stats.fenced = %d, want 3 (the zombie's three rejected calls)", got)
 	}
 }
