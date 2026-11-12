@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -353,40 +354,20 @@ func TestPoolSurvivesHandlerPanic(t *testing.T) {
 		"record": recorder(runs),
 	})
 
-	bad := mustEnqueue(t, q, queue.Spec{Type: "boom"})
-	waitStatus(t, q, bad, job.StatusRunning)
+	bad := mustEnqueue(t, q, queue.Spec{Type: "boom", MaxAttempts: 1})
+	waitStatus(t, q, bad, job.StatusDead)
 	good := mustEnqueue(t, q, queue.Spec{Type: "record"})
 
 	if got := waitRun(t, runs, 2*time.Second); got.id != good {
 		t.Fatalf("ran job %s, want %s", got.id, good)
 	}
 	waitStatus(t, q, good, job.StatusSucceeded)
-	waitStatus(t, q, bad, job.StatusRunning)
-}
-
-// Until retries exist (Phase 4), a failed job's lease simply expires and the
-// reaper hands it out again.
-func TestPoolRunsFailedJobAgainAfterLeaseExpires(t *testing.T) {
-	q, _, _ := newQueueWithLease(t, 100*time.Millisecond)
-	startPool(t, q, 1, worker.Handlers{
-		"fail": func(context.Context, *job.Job) error { return errors.New("nope") },
-	})
-	id := mustEnqueue(t, q, queue.Spec{Type: "fail"})
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		j, err := q.Get(context.Background(), id)
-		if err == nil && j.Attempts >= 3 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("job = %+v (err %v), want at least 3 attempts", j, err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The panic is recorded as an ordinary failure.
+	if j, _ := q.Get(context.Background(), bad); !strings.Contains(j.LastError, "kaboom") {
+		t.Errorf("LastError = %q, want it to mention the panic", j.LastError)
 	}
 }
 
-// A job can run far longer than its lease, as long as the heartbeat renews it.
 func TestPoolHeartbeatKeepsLongJobAlive(t *testing.T) {
 	const lease = 200 * time.Millisecond
 	q, rdb, keys := newQueueWithLease(t, lease)

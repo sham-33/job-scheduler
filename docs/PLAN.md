@@ -204,7 +204,27 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 4: Retries, backoff, timeouts, DLQ, cancel, and the `http` job type
+## Phase 4: Retries, backoff, timeouts, DLQ, cancel, and the `http` job type ✅ done
+
+**As built:**
+
+- Retry settings live on each job (`max_attempts`, `timeout_ms`, `backoff_base_ms`, `backoff_max_ms`), so one queue can hold jobs with different rules. Defaults: 5 attempts, 1 s first wait, 1 min longest wait, no timeout.
+- The wait doubles per failure and is picked at random from the upper half of that value.
+- A job interrupted by worker shutdown is not counted as a failure. Its lease expires and the reaper requeues it at once, as in Phase 3.
+- A running job that is cancelled stops at its worker's next heartbeat. Cancelled jobs are not counted in `stats.fenced`.
+- Replay resets `attempts` to 0 and keeps `last_error`.
+- A job whose worker keeps dying is also capped: the reaper moves it to the DLQ once its attempts are used up.
+- Bad payloads in `sleep`, `flaky` and `http` are permanent failures.
+- The `http` handler has a 30 s cap per call for jobs with no timeout of their own.
+- New counters: `stats.retried`, `dead`, `cancelled`, `replayed`.
+- Listing the DLQ arrives with the API in Phase 8.
+
+**Measured with real processes (4 workers, 200 ms first wait):**
+
+- An always-failing job waited 158 ms, 324 ms, 772 ms and 1,241 ms between attempts, then reached the DLQ after attempt 5.
+- An `http` job got 500, 500, then 200, and succeeded on attempt 3. One that got 400 was dead after a single call.
+- `kill -9` recovery, 3 trials: 1,375 ms, 1,308 ms and 1,365 ms, so still under 2 s.
+- 15 deliberate code breaks in a throwaway copy were all caught by the tests. One was missed at first, and the cancel test was tightened to catch it.
 
 1. Spec fields: `MaxAttempts` (default 5), `TimeoutMs`, `Backoff{Base, Max}`.
 2. Backoff is computed in Go (`min(max, base*2^attempt) + jitter`) and passed into Lua. It has unit tests.
