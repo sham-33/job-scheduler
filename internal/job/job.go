@@ -35,6 +35,16 @@ type Job struct {
 	Attempts       int             `json:"attempts"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 
+	// MaxAttempts is how many times the job may start before it is moved to
+	// the dead-letter queue. Zero means no limit.
+	MaxAttempts int `json:"max_attempts,omitempty"`
+	// Timeout cancels a single attempt that runs longer. Zero means no limit.
+	Timeout time.Duration `json:"-"`
+	// BackoffBase is the wait before the first retry. It doubles on each
+	// further retry, up to BackoffMax.
+	BackoffBase time.Duration `json:"-"`
+	BackoffMax  time.Duration `json:"-"`
+
 	// LeaseOwner is the worker that holds (or last held) the job.
 	LeaseOwner string `json:"lease_owner,omitempty"`
 	// LeaseToken is the fencing token from the latest claim. Only the holder
@@ -64,6 +74,10 @@ func FromHash(h map[string]string) (*Job, error) {
 		Status:         Status(h["status"]),
 		Attempts:       int(p.int("attempts")),
 		IdempotencyKey: h["idem_key"],
+		MaxAttempts:    int(p.int("max_attempts")),
+		Timeout:        p.duration("timeout_ms"),
+		BackoffBase:    p.duration("backoff_base_ms"),
+		BackoffMax:     p.duration("backoff_max_ms"),
 		LeaseOwner:     h["lease_owner"],
 		LeaseToken:     p.int("lease_token"),
 		LastError:      h["last_error"],
@@ -98,6 +112,10 @@ func (p *hashParser) int(field string) int64 {
 		p.err = fmt.Errorf("field %s: %q is not an integer", field, v)
 	}
 	return n
+}
+
+func (p *hashParser) duration(field string) time.Duration {
+	return time.Duration(p.int(field)) * time.Millisecond
 }
 
 func (p *hashParser) millis(field string) time.Time {

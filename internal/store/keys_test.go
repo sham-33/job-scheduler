@@ -11,6 +11,7 @@ func TestKeys(t *testing.T) {
 			k.Scheduled():        "jobs:scheduled",
 			k.Ready():            "jobs:ready",
 			k.Leases():           "jobs:leases",
+			k.DLQ():              "jobs:dlq",
 			k.LeaseToken():       "lease:token",
 			k.Idempotency("k-1"): "idem:k-1",
 			k.Stats():            "stats",

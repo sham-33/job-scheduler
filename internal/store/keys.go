@@ -28,6 +28,10 @@ func (k Keys) Ready() string { return k.prefix + "jobs:ready" }
 // Leases is a sorted set of running job IDs, scored by lease expiry (ms).
 func (k Keys) Leases() string { return k.prefix + "jobs:leases" }
 
+// DLQ is the dead-letter queue: a sorted set of IDs of jobs that ran out of
+// attempts or failed permanently, scored by when they died (ms).
+func (k Keys) DLQ() string { return k.prefix + "jobs:dlq" }
+
 // LeaseToken is a counter that issues a new fencing token for every claim.
 func (k Keys) LeaseToken() string { return k.prefix + "lease:token" }
 

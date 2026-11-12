@@ -15,19 +15,23 @@ import (
 )
 
 // HandlerFunc does the work for one job type. It should stop early and
-// return ctx.Err() when ctx is cancelled. Handlers run concurrently, so they
-// must be safe to call from many goroutines at once. A handler can also run
-// more than once for the same job, if a worker dies partway through, so its
-// side effects should be safe to repeat.
+// return ctx.Err() when ctx is cancelled, which is how timeouts, cancelled
+// jobs and shutdown reach it. Handlers run concurrently, so they must be
+// safe to call from many goroutines at once. A handler can also run more
+// than once for the same job, if it fails or its worker dies partway
+// through, so its side effects should be safe to repeat.
+//
+// Returning an error retries the job later. Wrap the error in job.Permanent
+// when retrying can't help.
 type HandlerFunc func(ctx context.Context, j *job.Job) error
 
 // Handlers maps a job type, such as "echo", to the code that runs it.
 type Handlers map[string]HandlerFunc
 
 const (
-	// completeTimeout bounds recording a result, which runs even when
+	// recordTimeout bounds recording a result, which runs even when
 	// shutdown has started so finished work isn't thrown away.
-	completeTimeout = 5 * time.Second
+	recordTimeout = 5 * time.Second
 	// abandonAfter is how long Run waits for handlers that ignore
 	// cancellation before exiting without them.
 	abandonAfter = time.Second
@@ -124,35 +128,72 @@ func (p *Pool) process(jobsCtx context.Context, j *job.Job) {
 	var heartbeat sync.WaitGroup
 	heartbeat.Go(func() { p.heartbeat(ctx, j, cancel, logger) })
 
-	err := p.execute(ctx, j)
+	// The timeout covers only the handler. The heartbeat keeps the lease
+	// until the failure is recorded.
+	runCtx := ctx
+	if j.Timeout > 0 {
+		var stop context.CancelFunc
+		runCtx, stop = context.WithTimeout(ctx, j.Timeout)
+		defer stop()
+	}
+	err := p.execute(runCtx, j)
+	timedOut := ctx.Err() == nil && errors.Is(runCtx.Err(), context.DeadlineExceeded)
 	cancel(nil) // stops the heartbeat; keeps the first cause if there was one
 	heartbeat.Wait()
+	logger = logger.With("took", time.Since(start))
 
-	if errors.Is(context.Cause(ctx), queue.ErrLeaseLost) {
-		logger.Warn("lease lost, abandoning job", "took", time.Since(start))
-		return
-	}
-	if err != nil {
-		// Retries and the dead-letter queue come in Phase 4. Until then the
-		// job's lease expires and the reaper hands it out again.
-		logger.Error("job failed", "err", err, "took", time.Since(start))
-		return
-	}
+	// The result is recorded even if shutdown has started, so finished work
+	// isn't thrown away.
+	recCtx, done := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+	defer done()
 
-	cctx, cancelComplete := context.WithTimeout(context.WithoutCancel(ctx), completeTimeout)
-	defer cancelComplete()
-	switch err := p.queue.Complete(cctx, j); {
-	case errors.Is(err, queue.ErrLeaseLost):
-		logger.Warn("result rejected: lease lost", "took", time.Since(start))
+	switch cause := context.Cause(ctx); {
+	case errors.Is(cause, queue.ErrLeaseLost):
+		logger.Warn("lease lost, abandoning job")
+	case errors.Is(cause, queue.ErrCancelled):
+		logger.Info("job cancelled, stopped")
+	case err == nil:
+		p.succeed(recCtx, j, logger)
+	case jobsCtx.Err() != nil:
+		// Shutdown interrupted the job, which is not the job's fault. Its
+		// lease expires and the reaper hands it to another worker right away.
+		logger.Warn("job interrupted by shutdown; another worker will take it")
+	case timedOut:
+		p.fail(recCtx, j, fmt.Errorf("timed out after %s", j.Timeout), logger)
+	default:
+		p.fail(recCtx, j, err, logger)
+	}
+}
+
+func (p *Pool) succeed(ctx context.Context, j *job.Job, logger *slog.Logger) {
+	switch err := p.queue.Complete(ctx, j); {
+	case errors.Is(err, queue.ErrLeaseLost), errors.Is(err, queue.ErrCancelled):
+		logger.Warn("result rejected", "reason", err)
 	case err != nil:
 		logger.Error("could not record success", "err", err)
 	default:
-		logger.Info("job succeeded", "took", time.Since(start))
+		logger.Info("job succeeded")
+	}
+}
+
+func (p *Pool) fail(ctx context.Context, j *job.Job, cause error, logger *slog.Logger) {
+	retryIn, dead, err := p.queue.Fail(ctx, j, cause)
+	switch {
+	case errors.Is(err, queue.ErrLeaseLost), errors.Is(err, queue.ErrCancelled):
+		logger.Warn("failure rejected", "reason", err, "err", cause)
+	case err != nil:
+		// The lease will expire and the reaper will hand the job out again.
+		logger.Error("could not record failure", "err", err, "cause", cause)
+	case dead:
+		logger.Error("job failed for good, moved to dead-letter queue", "err", cause)
+	default:
+		logger.Warn("job failed, will retry", "err", cause, "retry_in", retryIn)
 	}
 }
 
 // heartbeat renews j's lease until ctx is cancelled. If the lease is gone it
-// cancels the job, because another worker may already be running it.
+// cancels the job, because another worker may already be running it. It
+// also cancels a job that someone cancelled through the queue.
 func (p *Pool) heartbeat(ctx context.Context, j *job.Job, cancel context.CancelCauseFunc, logger *slog.Logger) {
 	ticker := time.NewTicker(p.opts.HeartbeatEvery)
 	defer ticker.Stop()
@@ -170,8 +211,8 @@ func (p *Pool) heartbeat(ctx context.Context, j *job.Job, cancel context.CancelC
 		switch {
 		case err == nil:
 			renewed = time.Now()
-		case errors.Is(err, queue.ErrLeaseLost):
-			cancel(queue.ErrLeaseLost)
+		case errors.Is(err, queue.ErrLeaseLost), errors.Is(err, queue.ErrCancelled):
+			cancel(err)
 			return
 		case ctx.Err() != nil:
 			return

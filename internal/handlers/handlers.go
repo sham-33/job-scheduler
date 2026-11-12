@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/sham-33/job-scheduler/internal/job"
@@ -18,6 +19,8 @@ func Default() worker.Handlers {
 	return worker.Handlers{
 		"echo":  Echo,
 		"sleep": Sleep,
+		"flaky": Flaky,
+		"http":  HTTP,
 	}
 }
 
@@ -38,11 +41,11 @@ func Sleep(ctx context.Context, j *job.Job) error {
 	var p SleepPayload
 	if len(j.Payload) > 0 {
 		if err := json.Unmarshal(j.Payload, &p); err != nil {
-			return fmt.Errorf("sleep: bad payload: %w", err)
+			return job.Permanent(fmt.Errorf("sleep: bad payload: %w", err))
 		}
 	}
 	if p.MS < 0 {
-		return fmt.Errorf("sleep: ms must not be negative, got %d", p.MS)
+		return job.Permanent(fmt.Errorf("sleep: ms must not be negative, got %d", p.MS))
 	}
 	t := time.NewTimer(time.Duration(p.MS) * time.Millisecond)
 	defer t.Stop()
@@ -52,4 +55,28 @@ func Sleep(ctx context.Context, j *job.Job) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// FlakyPayload is the payload of a "flaky" job, for example {"p": 0.5}.
+type FlakyPayload struct {
+	// P is the chance, from 0 to 1, that an attempt fails.
+	P float64 `json:"p"`
+}
+
+// Flaky fails at random, to stand in for work that depends on an unreliable
+// service. An empty payload never fails.
+func Flaky(_ context.Context, j *job.Job) error {
+	var p FlakyPayload
+	if len(j.Payload) > 0 {
+		if err := json.Unmarshal(j.Payload, &p); err != nil {
+			return job.Permanent(fmt.Errorf("flaky: bad payload: %w", err))
+		}
+	}
+	if p.P < 0 || p.P > 1 {
+		return job.Permanent(fmt.Errorf("flaky: p must be between 0 and 1, got %v", p.P))
+	}
+	if rand.Float64() < p.P {
+		return fmt.Errorf("flaky: unlucky on attempt %d", j.Attempts)
+	}
+	return nil
 }
