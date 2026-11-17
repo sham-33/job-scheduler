@@ -61,6 +61,8 @@ var (
 	cancelSrc string
 	//go:embed scripts/replay.lua
 	replaySrc string
+	//go:embed scripts/release.lua
+	releaseSrc string
 
 	enqueueScript   = newScript(enqueueSrc)
 	promoteScript   = newScript(promoteSrc)
@@ -71,6 +73,7 @@ var (
 	failScript      = newScript(failSrc)
 	cancelScript    = newScript(cancelSrc)
 	replayScript    = newScript(replaySrc)
+	releaseScript   = newScript(releaseSrc)
 )
 
 // newScript prepends the shared helpers. go-redis sends the script's SHA
@@ -256,6 +259,19 @@ func (q *Queue) Fail(ctx context.Context, j *job.Job, cause error) (retryIn time
 		return 0, true, nil
 	}
 	return retryIn, false, leaseErr(code)
+}
+
+// Release hands a claimed job straight back to the ready set, without
+// counting the attempt, for a worker that is shutting down and can't finish
+// it. Like Complete, it returns ErrLeaseLost or ErrCancelled if the caller no
+// longer owns the job.
+func (q *Queue) Release(ctx context.Context, j *job.Job) error {
+	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Ready(), q.keys.Stats()}
+	code, err := releaseScript.Run(ctx, q.rdb, keys, j.ID, j.LeaseToken).Int()
+	if err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+	return leaseErr(code)
 }
 
 // Heartbeat renews the lease on a claimed job. It returns ErrLeaseLost if j's

@@ -210,7 +210,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 - Retry settings live on each job (`max_attempts`, `timeout_ms`, `backoff_base_ms`, `backoff_max_ms`), so one queue can hold jobs with different rules. Defaults: 5 attempts, 1 s first wait, 1 min longest wait, no timeout.
 - The wait doubles per failure and is picked at random from the upper half of that value.
-- A job interrupted by worker shutdown is not counted as a failure. Its lease expires and the reaper requeues it at once, as in Phase 3.
+- A job interrupted by worker shutdown is not counted as a failure. The worker hands it straight back to `jobs:ready` with `release.lua`, which also gives back the attempt (fixed after Phase 4, see below).
 - A running job that is cancelled stops at its worker's next heartbeat. Cancelled jobs are not counted in `stats.fenced`.
 - Replay resets `attempts` to 0 and keeps `last_error`.
 - A job whose worker keeps dying is also capped: the reaper moves it to the DLQ once its attempts are used up.
@@ -244,6 +244,13 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 - `http` jobs against a fake test server end correctly for each reply: 200 succeeds, 500 retries and succeeds once the server recovers, a server that never answers times out and retries, and 400 goes straight to the DLQ.
 
 **Key concept:** why a scheduler calls the user's code instead of running it.
+
+**Fixes after Phase 4** (found in a bug hunt before Phase 5):
+
+- **Graceful shutdown used up an attempt.** The interrupted job was left for its lease to expire, and the reaper counted that as a failed attempt. A job on its last attempt went to the DLQ although it never failed. Now `release.lua` (token-checked) puts the job back in `jobs:ready` at once and gives back the attempt. With real processes, the other worker started it 68 ms after the release, as attempt 1. New counter: `stats.released`.
+- **`http` jobs could never run longer than 30 s.** The 30 s cap was set on the HTTP client, so it also cut off jobs with a longer `Timeout` of their own. Now it applies only when the job has none.
+- **`http` errors leaked secrets.** Errors repeated the full URL, query string included, into logs and `last_error`. Now they name only the scheme and host, since webhook URLs often keep the secret in the path.
+- Left for later, all minor: invalid headers are retried instead of failing for good; sub-millisecond timeouts and waits are silently dropped; setting only `Backoff.Max` below 1 s is rejected; error truncation can split a UTF-8 character; a second Ctrl-C doesn't force the worker to quit.
 
 ---
 

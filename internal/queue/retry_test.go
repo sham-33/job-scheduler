@@ -370,3 +370,62 @@ func TestReplay(t *testing.T) {
 		t.Errorf("Replay(succeeded job) = %v, want ErrNotDead", err)
 	}
 }
+
+func TestReleaseGivesTheAttemptBack(t *testing.T) {
+	q, rdb, keys := newTestQueue(t)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo", MaxAttempts: 1})
+	runAt := mustGet(t, q, id).RunAt
+	claimed := mustClaim(t, q, "w1")
+
+	if err := q.Release(ctx, claimed); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	j := mustGet(t, q, id)
+	if j.Status != job.StatusReady || j.Attempts != 0 {
+		t.Errorf("job = %+v, want ready with 0 attempts", j)
+	}
+	if score, ok := inZSet(t, rdb, keys.Ready(), id); !ok || int64(score) != runAt.UnixMilli() {
+		t.Errorf("ready score = %v (in set: %v), want the original run_at %d", score, ok, runAt.UnixMilli())
+	}
+	if _, ok := inZSet(t, rdb, keys.Leases(), id); ok {
+		t.Error("released job still has a lease")
+	}
+	if got := stat(t, rdb, keys, "released"); got != 1 {
+		t.Errorf("stats.released = %d, want 1", got)
+	}
+
+	// A job with one attempt can still run, and the old token is now stale.
+	again := mustClaim(t, q, "w2")
+	if again.ID != id || again.Attempts != 1 {
+		t.Fatalf("claim after release = %+v, want attempt 1 of the same job", again)
+	}
+	if err := q.Release(ctx, claimed); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("Release with the old token = %v, want ErrLeaseLost", err)
+	}
+	if err := q.Complete(ctx, again); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if err := q.Release(ctx, again); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("Release(succeeded job) = %v, want ErrLeaseLost", err)
+	}
+	if j := mustGet(t, q, id); j.Status != job.StatusSucceeded {
+		t.Errorf("Status = %s, want it to stay succeeded", j.Status)
+	}
+}
+
+func TestReleaseCancelledJob(t *testing.T) {
+	q, _, _ := newTestQueue(t)
+	ctx := context.Background()
+	id := mustEnqueue(t, q, Spec{Type: "echo"})
+	claimed := mustClaim(t, q, "w1")
+	if err := q.Cancel(ctx, id); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if err := q.Release(ctx, claimed); !errors.Is(err, ErrCancelled) {
+		t.Errorf("Release = %v, want ErrCancelled", err)
+	}
+	if j := mustGet(t, q, id); j.Status != job.StatusCancelled {
+		t.Errorf("Status = %s, want it to stay cancelled", j.Status)
+	}
+}

@@ -533,9 +533,39 @@ func TestPoolCancelsJobsWhenGraceRunsOut(t *testing.T) {
 	if took < grace || took > grace+time.Second {
 		t.Errorf("shutdown took %s, want about the %s grace period", took, grace)
 	}
-	// It keeps its lease, so the reaper can hand it to another worker.
-	if j, _ := q.Get(context.Background(), id); j.Status != job.StatusRunning {
-		t.Errorf("Status = %s, want running", j.Status)
+	// It goes straight back for another worker, and the interrupted attempt
+	// doesn't count.
+	if j, _ := q.Get(context.Background(), id); j.Status != job.StatusReady || j.Attempts != 0 {
+		t.Errorf("job = %+v, want ready with 0 attempts", j)
+	}
+}
+
+func TestPoolShutdownDoesNotUseUpAnAttempt(t *testing.T) {
+	q, _, _ := newQueueWithLease(t, 300*time.Millisecond)
+	started := make(chan struct{}, 1)
+	stop := startPoolWith(t, q, worker.Options{Concurrency: 1, ShutdownGrace: 10 * time.Millisecond}, worker.Handlers{
+		"long": func(ctx context.Context, _ *job.Job) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	// One attempt only: before the fix, the reaper buried it as "lease expired".
+	id := mustEnqueue(t, q, queue.Spec{Type: "long", MaxAttempts: 1})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job never started")
+	}
+	stop()
+
+	// The next worker to start runs it to the end.
+	runs := make(chan run, 1)
+	startPool(t, q, 1, worker.Handlers{"long": recorder(runs)})
+	waitRun(t, runs, 2*time.Second)
+	waitStatus(t, q, id, job.StatusSucceeded)
+	if j, _ := q.Get(context.Background(), id); j.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", j.Attempts)
 	}
 }
 
