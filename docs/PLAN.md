@@ -254,7 +254,33 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 5: Scheduler service and leader election
+## Phase 5: Scheduler service and leader election ✅ done
+
+**As built:**
+
+- Three Lua scripts in `internal/election/scripts/`:
+  - `acquire.lua` takes a free seat (`SET … PX`) and `INCR`s the epoch in the same atomic step.
+  - `renew.lua` is compare-and-PEXPIRE.
+  - `release.lua` is compare-and-DEL.
+- A candidate can take back a seat that still holds its own ID, as a new term. This happens when a renewal failed on its side but reached Redis.
+- **Callbacks:** `OnElected`/`OnDemoted` became one function, `lead(ctx, epoch)`, whose context is cancelled when the term ends. `Run` waits for it to return before campaigning again, so one process never runs two terms at once.
+- **Renewal rules:**
+  - Each renewal gives up after `LEADER_RENEW_EVERY`. A leader cut off from Redis therefore stops at least `LEADER_TTL − 2 × LEADER_RENEW_EVERY` (1 s by default) before its seat expires.
+  - A renewal that fails, or finds someone else in the seat, ends the term at once.
+  - If `lead` returns by itself, the term ends too.
+- **Candidate ID:** `NODE_ID` plus a random suffix. A restarted container keeps its hostname and pid 1, and two schedulers with one ID would both think they lead.
+- **Timing:** a follower checks the seat every `LEADER_RENEW_EVERY/4` (250 ms), so a graceful handover takes about 250 ms. New settings: `LEADER_TTL` (3 s) and `LEADER_RENEW_EVERY` (1 s).
+- **Workers:** they no longer run the promoter and reaper, so they need a scheduler running.
+- **Effect of a leader failover on jobs:** promotion and reaping pause for up to about 3 s. A delayed job due in that window starts late, and a worker that dies in that window is recovered late. Phase 12 kills the leader every 30 s, so it may need a shorter `LEADER_TTL` to keep worker recovery under 2 s.
+
+**Measured with real processes (2 schedulers, 2 workers):**
+
+- `kill -9` the leader, 5 trials: another scheduler took over after 2,110, 2,342, 2,427, 2,761 and 2,765 ms.
+- Ctrl-C the leader: taken over after 254 ms.
+- 300 delayed jobs spread over 9 s, leader killed 3 s in: all 300 succeeded and each ran exactly once (`claimed` = 300). The latest started 3.1 s after its `run_at`.
+- Leader frozen (`kill -STOP`) for 5 s: another took over after 2.5 s. When woken, the old leader logged `lost leadership` at its first renewal.
+- Leader's connection to Redis silently dropping traffic, 3 trials with the defaults: it stopped leading 1,026–1,031 ms before the next leader started.
+- 14 deliberate code breaks in a throwaway copy were all caught by the tests. A 15th changed only a log message, so no test can tell.
 
 1. `internal/election`:
    - Acquire with `SET scheduler:leader <node> NX PX 3000`, plus `INCR scheduler:epoch`.

@@ -10,6 +10,7 @@ import (
 var allKeys = []string{
 	"NODE_ID", "LOG_LEVEL", "REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "HTTP_ADDR",
 	"CONCURRENCY", "LEASE_TTL", "HEARTBEAT_EVERY", "REAP_EVERY", "SHUTDOWN_GRACE",
+	"LEADER_TTL", "LEADER_RENEW_EVERY",
 }
 
 // clearEnv blanks every config variable for the test; Load treats empty as unset.
@@ -40,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 		HeartbeatEvery: 500 * time.Millisecond,
 		ReapEvery:      200 * time.Millisecond,
 		ShutdownGrace:  5 * time.Second,
+
+		LeaderTTL:        3 * time.Second,
+		LeaderRenewEvery: time.Second,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v\nwant     %+v", cfg, want)
@@ -59,6 +63,8 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("HEARTBEAT_EVERY", "1s")
 	t.Setenv("REAP_EVERY", "250ms")
 	t.Setenv("SHUTDOWN_GRACE", "30s")
+	t.Setenv("LEADER_TTL", "10s")
+	t.Setenv("LEADER_RENEW_EVERY", "2s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -76,6 +82,9 @@ func TestLoadOverrides(t *testing.T) {
 		HeartbeatEvery: time.Second,
 		ReapEvery:      250 * time.Millisecond,
 		ShutdownGrace:  30 * time.Second,
+
+		LeaderTTL:        10 * time.Second,
+		LeaderRenewEvery: 2 * time.Second,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v\nwant     %+v", cfg, want)
@@ -96,6 +105,8 @@ func TestLoadInvalid(t *testing.T) {
 		{"negative grace", map[string]string{"SHUTDOWN_GRACE": "-1s"}, "SHUTDOWN_GRACE"},
 		{"bad log level", map[string]string{"LOG_LEVEL": "loud"}, "LOG_LEVEL"},
 		{"heartbeat too slow for lease", map[string]string{"LEASE_TTL": "1s", "HEARTBEAT_EVERY": "600ms"}, "at most half of LEASE_TTL"},
+		{"zero leader ttl", map[string]string{"LEADER_TTL": "0s"}, "LEADER_TTL must be positive"},
+		{"renewal too slow for leader ttl", map[string]string{"LEADER_TTL": "3s", "LEADER_RENEW_EVERY": "2s"}, "at most half of LEADER_TTL"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

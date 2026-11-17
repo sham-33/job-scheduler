@@ -1,9 +1,9 @@
 BIN := bin
 
-.PHONY: help redis-up redis-down redis-cli build test vet tidy run-worker
+.PHONY: help redis-up redis-down redis-cli build test vet tidy run-worker run-scheduler
 
 help: ## List targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
 redis-up: ## Start Redis in Docker and wait until it is healthy
 	docker compose up -d --wait redis
@@ -28,3 +28,6 @@ tidy: ## Sync go.mod and go.sum with the imports
 
 run-worker: ## Run a worker against REDIS_ADDR (default localhost:6379)
 	go run ./cmd/worker
+
+run-scheduler: ## Run a scheduler (start two for failover; one is elected leader)
+	go run ./cmd/scheduler

@@ -15,6 +15,8 @@ func TestKeys(t *testing.T) {
 			k.LeaseToken():       "lease:token",
 			k.Idempotency("k-1"): "idem:k-1",
 			k.Stats():            "stats",
+			k.Leader():           "scheduler:leader",
+			k.Epoch():            "scheduler:epoch",
 		}
 		for got, want := range tests {
 			if got != prefix+want {
