@@ -1,6 +1,7 @@
 // Command scheduler keeps jobs moving: it releases delayed jobs when they
-// fall due and takes jobs back from dead workers. Run two or more for
-// failover. They elect one leader, and only the leader does the work.
+// fall due, takes jobs back from dead workers, and fires crons. Run two or
+// more for failover. They elect one leader, and only the leader does the
+// work.
 package main
 
 import (

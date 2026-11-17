@@ -1,7 +1,7 @@
 // Package scheduler holds the housekeeping loops that keep jobs moving:
-// releasing delayed jobs when they fall due, and reclaiming jobs from dead
-// workers. The scheduler service runs them only while it is the elected
-// leader (see package election).
+// releasing delayed jobs when they fall due, reclaiming jobs from dead
+// workers, and firing crons. The scheduler service runs them only while it
+// is the elected leader (see package election).
 package scheduler
 
 import (
@@ -19,6 +19,7 @@ func Lead(ctx context.Context, q *queue.Queue, reapEvery time.Duration, logger *
 	var wg sync.WaitGroup
 	wg.Go(func() { RunPromoter(ctx, q, logger) })
 	wg.Go(func() { RunReaper(ctx, q, reapEvery, logger) })
+	wg.Go(func() { RunCron(ctx, q, logger) })
 	wg.Wait()
 }
 

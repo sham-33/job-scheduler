@@ -21,27 +21,13 @@ if idem ~= '' then
 end
 
 local now = now_ms()
-local run_at = now + tonumber(ARGV[4])
-local status = 'ready'
-if run_at > now then
-  status = 'scheduled'
-end
-
-redis.call('HSET', KEYS[1],
-  'id', id, 'type', ARGV[2], 'payload', ARGV[3], 'status', status,
-  'attempts', 0, 'idem_key', idem, 'run_at', run_at,
-  'max_attempts', ARGV[7], 'timeout_ms', ARGV[8],
-  'backoff_base_ms', ARGV[9], 'backoff_max_ms', ARGV[10],
-  'created_at', now, 'updated_at', now)
-
-if status == 'ready' then
-  redis.call('ZADD', KEYS[2], run_at, id)
-else
-  redis.call('ZADD', KEYS[3], run_at, id)
-end
+create_job(KEYS[1], KEYS[2], KEYS[3], KEYS[5], id, now + tonumber(ARGV[4]), now, {
+  type = ARGV[2], payload = ARGV[3], idem_key = idem,
+  max_attempts = ARGV[7], timeout_ms = ARGV[8],
+  backoff_base_ms = ARGV[9], backoff_max_ms = ARGV[10],
+})
 
 if idem ~= '' then
   redis.call('SET', KEYS[4], id, 'EX', ARGV[6])
 end
-redis.call('HINCRBY', KEYS[5], 'submitted', 1)
 return {id, 1}

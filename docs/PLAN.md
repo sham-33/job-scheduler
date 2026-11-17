@@ -74,8 +74,8 @@ The goal is the project in this resume bullet:
 | `idem:{key}`                           | STRING (TTL 24h)           | maps an idempotency key to a job id                                                                                                       |
 | `lease:token`                          | STRING (INCR)              | monotonically increasing fencing token                                                                                                    |
 | `scheduler:leader` / `scheduler:epoch` | STRING PX / INCR           | leader lease and leadership epoch                                                                                                         |
-| `cron:{name}` / `crons`                | HASH / SET                 | cron definitions                                                                                                                          |
-| `cron:fired:{name}:{ts}`               | STRING NX TTL              | dedupe for each cron fire                                                                                                                 |
+| `cron:{name}` / `crons`                | HASH / ZSET score=next_run | cron definitions. `crons` is scored by next fire time in ms, and a disabled cron scores +inf                                              |
+| `cron:fired:{name}:{ts}`               | not built                  | not needed: the idempotency key `idem:cron:{name}:{ts}` that each fire writes does this dedupe                                            |
 | `workers`                              | ZSET score=last_seen       | worker registry                                                                                                                           |
 | `stats`                                | HASH                       | counters: submitted, succeeded, retried, dead, reclaimed…                                                                                 |
 | `events`                               | STREAM (MAXLEN ~10k)       | lifecycle events, used by the dashboard and to measure recovery time                                                                      |
@@ -295,7 +295,44 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 6: Cron schedules
+## Phase 6: Cron schedules ✅ done
+
+**As built:**
+
+- **Where it lives:** the cron code is in `internal/queue` (`cron.go`, `schedule.go`, `scripts/cron_*.lua`), because firing a cron creates a job in the same atomic step. `lib.lua` gained `create_job()`, which `enqueue.lua` and `cron_fire.lua` share. The leader's loop is `scheduler.RunCron`, every 100 ms.
+- **`crons` is a sorted set, not a plain set.** It is scored by each cron's next fire time, and a disabled cron scores `+inf`. The leader finds due crons the way the promoter finds due jobs, and listing returns crons soonest first.
+- **No `cron:fired:{name}:{ts}` key.** Firing is one Lua script, `cron_fire.lua`. It checks that the cron is still enabled, on the same schedule, and waiting for this slot, a compare-and-set on `next_run`. Then it moves `next_run` on and creates the job. The job's idempotency key `cron:{name}:{ts}` (24 h) covers the rest: a slot that already has a job never gets a second one, even if the cron was deleted and saved again. `Enqueue` rejects client keys that start with `cron:`.
+- **A fired job's `run_at` is its slot.** So `created_at − run_at` is how late it fired, and it queues ahead of work that came due later.
+- **Missed-fire policy:** a cron that fell behind fires once for its oldest missed slot and logs a warning, then jumps to its first slot after now. `@every` keeps its grid when it is only a little late.
+- **Schedules** use robfig's standard parser: five fields, or a shorthand such as `@hourly` or `@every 30s`. They are read in UTC unless they start with `CRON_TZ=<zone>`. `@every` must be a whole number of seconds, at least 1 s. robfig would otherwise round the interval down to whole seconds and raise anything shorter to 1 s, so `@every 1500ms` would fire every second. The next slot is always computed from Redis's clock. `time/tzdata` is embedded, so a container without zoneinfo files reads zones the same way.
+- **API for Phase 8:**
+  - `PutCron` creates or replaces a cron. It keeps the disabled state, `created_at` and the last fire, and restarts the schedule from now.
+  - `GetCron` and `ListCrons`.
+  - `SetCronEnabled`. Turning a cron back on restarts it from now, so slots missed while it was off never fire.
+  - `DeleteCron`.
+  - `FireDueCrons`, for the leader.
+- **A cron whose stored schedule can't be parsed,** for example after a hand edit in Redis, is disabled and logged once. Otherwise it would fail every 100 ms.
+- **A name in `crons` whose hash is gone** (deleted by hand, say) is removed by `cron_due.lua`. Left there, it would stay at the front of every listing and could crowd real crons out of the limit.
+- New counter: `stats.cron_fired`.
+
+**Measured with real processes** (2 schedulers, 1 worker, default settings), with crons `*/1 * * * *` and `@every 5s` running for 7 minutes. A fault hit the leader just before most minute boundaries:
+
+| Slot (UTC) | Just before it                                         | Jobs | Fired late |
+| ---------- | ------------------------------------------------------ | ---- | ---------- |
+| 08:10      | nothing                                                | 1    | 60 ms      |
+| 08:11      | `kill -9` the leader 1.5 s before                      | 1    | 1,029 ms   |
+| 08:12      | `kill -STOP` the leader 1 s before, woken 5 s later    | 1    | 2,129 ms   |
+| 08:13      | Ctrl-C the leader 1 s before                           | 1    | 66 ms      |
+| 08:14      | both schedulers down from 08:13:50 to 08:15:05         | 1    | 65.2 s     |
+| 08:15      | the same outage                                        | 0    | skipped    |
+| 08:16      | nothing                                                | 1    | 68 ms      |
+
+- **Takeover times:** another scheduler took over 2.3 s after the `kill -9`, 2.9 s after the `kill -STOP`, and 0.1 s after the Ctrl-C.
+- **The paused leader** logged `lost leadership` at its first renewal after waking, and fired nothing.
+- **`@every 5s`:** 66 slots, one job each, normally 20–68 ms late (the 100 ms tick). After the outage, slot 08:13:52 fired once, 73.2 s late. The 14 slots after it were skipped, and the cron went on from 08:15:10.
+- **Totals:** 72 jobs. `submitted`, `cron_fired`, `claimed` and `succeeded` were all 72. Every job succeeded on its first attempt, and no slot had two jobs.
+- **Integration test** (`TestFailoverFiresEachCronSlotOnce`, 300 ms term): in 7 runs, the slot that came due during the handover fired 234–308 ms late, and every slot had exactly one job.
+- 23 deliberate code breaks in a throwaway copy: the tests caught 22. At first they caught 21; the re-enable test couldn't tell a reschedule that landed on the same minute, so it was tightened. No test can see the 23rd, which removes the `enabled` check from `cron_fire.lua`: a disabled cron's `next_run` is `0`, so the `next_run` comparison already refuses it. The check stays as a second line of defence.
 
 1. A `cron:{name}` hash holds spec, job template, `next_run` and `enabled`. Names go in the `crons` set.
 2. The leader runs `SET cron:fired:{name}:{ts} NX`, and only if that succeeds enqueues a job with idempotency key `cron:{name}:{ts}`.

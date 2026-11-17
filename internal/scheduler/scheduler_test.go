@@ -38,6 +38,30 @@ func startScheduler(t *testing.T, keys store.Keys, id string, ttl time.Duration)
 	return rdb
 }
 
+// waitForLeader returns the ID of the scheduler that wins the first term.
+func waitForLeader(t *testing.T, rdb *redis.Client, keys store.Keys) string {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); ; {
+		if leader, _, _ := election.Leader(context.Background(), rdb, keys); leader != "" {
+			return leader
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no leader elected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// redisNow reads the clock the scripts use.
+func redisNow(t *testing.T, rdb *redis.Client) time.Time {
+	t.Helper()
+	now, err := rdb.Time(context.Background()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return now
+}
+
 func TestFailoverKeepsDelayedJobsMoving(t *testing.T) {
 	const (
 		ttl    = 300 * time.Millisecond
@@ -53,14 +77,7 @@ func TestFailoverKeepsDelayedJobsMoving(t *testing.T) {
 		"a": startScheduler(t, keys, "a", ttl),
 		"b": startScheduler(t, keys, "b", ttl),
 	}
-	var leader string
-	for deadline := time.Now().Add(time.Second); leader == ""; {
-		if time.Now().After(deadline) {
-			t.Fatal("no leader elected")
-		}
-		leader, _, _ = election.Leader(ctx, rdb, keys)
-		time.Sleep(10 * time.Millisecond)
-	}
+	leader := waitForLeader(t, rdb, keys)
 
 	ids := map[string]bool{}
 	for i := range jobs {
@@ -113,6 +130,67 @@ func TestFailoverKeepsDelayedJobsMoving(t *testing.T) {
 	}
 }
 
+func TestFailoverFiresEachCronSlotOnce(t *testing.T) {
+	const (
+		ttl   = 300 * time.Millisecond
+		slots = 4
+	)
+	rdb := storetest.Client(t)
+	keys := storetest.Keys(t, rdb)
+	q := queue.New(rdb, keys, 2*time.Second)
+	ctx := context.Background()
+
+	conns := map[string]*redis.Client{
+		"a": startScheduler(t, keys, "a", ttl),
+		"b": startScheduler(t, keys, "b", ttl),
+	}
+	leader := waitForLeader(t, rdb, keys)
+	c, err := q.PutCron(ctx, queue.CronSpec{Name: "tick", Schedule: "@every 1s", Job: queue.Spec{Type: "echo"}})
+	if err != nil {
+		t.Fatalf("PutCron: %v", err)
+	}
+	first := c.NextRun
+
+	// Cut the leader off 100ms before the second slot, so that slot falls
+	// due while no one leads.
+	time.AfterFunc(first.Add(900*time.Millisecond).Sub(redisNow(t, rdb)), func() { _ = conns[leader].Close() })
+	time.Sleep(first.Add(slots*time.Second - 500*time.Millisecond).Sub(redisNow(t, rdb)))
+
+	// Every slot on the cron's one-second grid has exactly one job.
+	jobs := map[time.Time]int{}
+	var late time.Duration
+	for {
+		j, err := q.Claim(ctx, "w")
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if j == nil {
+			break
+		}
+		jobs[j.RunAt]++
+		late = max(late, j.CreatedAt.Sub(j.RunAt))
+	}
+	for i := range slots {
+		slot := first.Add(time.Duration(i) * time.Second)
+		if jobs[slot] != 1 {
+			t.Errorf("slot %d (%s) has %d jobs, want 1", i, slot.Format(time.StampMilli), jobs[slot])
+		}
+		delete(jobs, slot)
+	}
+	for slot, n := range jobs {
+		t.Errorf("%d jobs for unexpected slot %s", n, slot.Format(time.StampMilli))
+	}
+	now, epoch, _ := election.Leader(ctx, rdb, keys)
+	t.Logf("leader %s was cut off; %s took over (epoch %d); the latest slot fired %s late",
+		leader, now, epoch, late.Round(time.Millisecond))
+	if now == leader || epoch != 2 {
+		t.Errorf("leader after failover = %q (epoch %d), want the other scheduler in epoch 2", now, epoch)
+	}
+	if late > ttl+500*time.Millisecond {
+		t.Errorf("a slot fired %s late, want under %s", late, ttl+500*time.Millisecond)
+	}
+}
+
 func TestLeadRunsEveryLoop(t *testing.T) {
 	rdb := storetest.Client(t)
 	keys := storetest.Keys(t, rdb)
@@ -131,6 +209,10 @@ func TestLeadRunsEveryLoop(t *testing.T) {
 	delayed, _, err := q.Enqueue(ctx, queue.Spec{Type: "echo", Delay: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
+	}
+	// A cron with a slot due within a second.
+	if _, err := q.PutCron(ctx, queue.CronSpec{Name: "tick", Schedule: "@every 1s", Job: queue.Spec{Type: "echo"}}); err != nil {
+		t.Fatalf("PutCron: %v", err)
 	}
 
 	leadCtx, stop := context.WithCancel(ctx)
@@ -156,5 +238,18 @@ func TestLeadRunsEveryLoop(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		c, err := q.GetCron(ctx, "tick")
+		if err != nil {
+			t.Fatalf("GetCron: %v", err)
+		}
+		if c.LastJobID != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the cron never fired")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
