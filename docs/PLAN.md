@@ -304,7 +304,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 - **No `cron:fired:{name}:{ts}` key.** Firing is one Lua script, `cron_fire.lua`. It checks that the cron is still enabled, on the same schedule, and waiting for this slot, a compare-and-set on `next_run`. Then it moves `next_run` on and creates the job. The job's idempotency key `cron:{name}:{ts}` (24 h) covers the rest: a slot that already has a job never gets a second one, even if the cron was deleted and saved again. `Enqueue` rejects client keys that start with `cron:`.
 - **A fired job's `run_at` is its slot.** So `created_at − run_at` is how late it fired, and it queues ahead of work that came due later.
 - **Missed-fire policy:** a cron that fell behind fires once for its oldest missed slot and logs a warning, then jumps to its first slot after now. `@every` keeps its grid when it is only a little late.
-- **Schedules** use robfig's standard parser: five fields, or a shorthand such as `@hourly` or `@every 30s`. They are read in UTC unless they start with `CRON_TZ=<zone>`. The next slot is always computed from Redis's clock. `time/tzdata` is embedded, so a container without zoneinfo files reads zones the same way.
+- **Schedules** use robfig's standard parser: five fields, or a shorthand such as `@hourly` or `@every 30s`. They are read in UTC unless they start with `CRON_TZ=<zone>`. `@every` must be a whole number of seconds, at least 1 s. robfig would otherwise round the interval down to whole seconds and raise anything shorter to 1 s, so `@every 1500ms` would fire every second. The next slot is always computed from Redis's clock. `time/tzdata` is embedded, so a container without zoneinfo files reads zones the same way.
 - **API for Phase 8:**
   - `PutCron` creates or replaces a cron. It keeps the disabled state, `created_at` and the last fire, and restarts the schedule from now.
   - `GetCron` and `ListCrons`.
@@ -312,6 +312,7 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
   - `DeleteCron`.
   - `FireDueCrons`, for the leader.
 - **A cron whose stored schedule can't be parsed,** for example after a hand edit in Redis, is disabled and logged once. Otherwise it would fail every 100 ms.
+- **A name in `crons` whose hash is gone** (deleted by hand, say) is removed by `cron_due.lua`. Left there, it would stay at the front of every listing and could crowd real crons out of the limit.
 - New counter: `stats.cron_fired`.
 
 **Measured with real processes** (2 schedulers, 1 worker, default settings), with crons `*/1 * * * *` and `@every 5s` running for 7 minutes. A fault hit the leader just before most minute boundaries:

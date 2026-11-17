@@ -72,7 +72,7 @@ If the leader dies, its key expires and another scheduler takes over within abou
 
 A cron is a job template plus a schedule. The leading scheduler checks every 100ms for crons that are due, and makes exactly one job for each scheduled time, called a slot.
 
-- **Schedule:** a standard five-field expression such as `*/5 * * * *`, or a shorthand such as `@hourly` or `@every 30s`. It is read in UTC unless it starts with a zone, as in `CRON_TZ=Asia/Kolkata 0 9 * * *`.
+- **Schedule:** a standard five-field expression such as `*/5 * * * *`, or a shorthand such as `@hourly` or `@every 30s`. `@every` takes a whole number of seconds, at least `1s`. It is read in UTC unless it starts with a zone, as in `CRON_TZ=Asia/Kolkata 0 9 * * *`.
 - **Job:** the same options as any other job: type, payload, `MaxAttempts`, `Timeout` and `Backoff`. Each job's `run_at` is its slot, and its idempotency key is `cron:{name}:{slot in ms}`.
 - **One job per slot:** **cron_fire.lua** creates the slot's job and moves the cron on to its next slot in one atomic step. It does this only if the cron is still waiting for that slot. So two schedulers racing for a slot, or a paused leader that wakes up after its successor fired one, can't make a second job.
 - **Missed slots:** a cron that fell behind, because no scheduler was running, fires once for its oldest missed slot and then skips to its first slot after now. It doesn't make a job for every slot it missed.

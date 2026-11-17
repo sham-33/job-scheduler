@@ -1,7 +1,9 @@
 package queue
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 	// Embeds the time zone database, so a CRON_TZ schedule reads the same in
 	// every process, even in a container image that has no zoneinfo files.
@@ -16,10 +18,31 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 func parseSchedule(spec string) (cron.Schedule, error) {
 	s, err := cronParser.Parse(spec)
+	if err == nil {
+		if _, isEvery := s.(cron.ConstantDelaySchedule); isEvery {
+			err = checkEvery(spec)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("schedule %q: %w", spec, err)
 	}
 	return s, nil
+}
+
+// checkEvery rejects an @every interval that robfig would quietly change. It
+// rounds the interval down to whole seconds and raises anything shorter,
+// zero and negative included, to 1s, so "@every 1500ms" would fire every
+// second. spec has already parsed as an @every schedule.
+func checkEvery(spec string) error {
+	_, after, _ := strings.Cut(spec, "@every ")
+	every, err := time.ParseDuration(strings.TrimSpace(after))
+	switch {
+	case err != nil:
+		return err
+	case every < time.Second || every%time.Second != 0:
+		return errors.New("@every takes a whole number of seconds, at least 1s")
+	}
+	return nil
 }
 
 // Every function below hands the schedule a UTC time. A schedule without a

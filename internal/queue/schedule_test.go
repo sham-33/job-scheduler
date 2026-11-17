@@ -30,7 +30,10 @@ func TestParseSchedule(t *testing.T) {
 		"0 9 * * 1-5",
 		"@hourly",
 		"@every 30s",
+		"@every 1s",
+		"@every 1m30s",
 		"CRON_TZ=Asia/Kolkata 0 9 * * *",
+		"CRON_TZ=Asia/Kolkata @every 2s",
 	} {
 		if _, err := parseSchedule(spec); err != nil {
 			t.Errorf("parseSchedule(%q): %v", spec, err)
@@ -44,6 +47,12 @@ func TestParseSchedule(t *testing.T) {
 		"@every soon",   // not a duration
 		"@fortnightly",  // no such descriptor
 		"CRON_TZ=Nowhere/Land * * * * *",
+		// robfig would fire each of these every 1s.
+		"@every 1500ms",
+		"@every 100ms",
+		"@every 0s",
+		"@every -5s",
+		"CRON_TZ=Asia/Kolkata @every 1500ms",
 	} {
 		if _, err := parseSchedule(spec); err == nil {
 			t.Errorf("parseSchedule(%q) succeeded, want an error", spec)

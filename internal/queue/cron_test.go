@@ -560,6 +560,43 @@ func TestFireDueCronsDisablesUnreadableSchedule(t *testing.T) {
 	}
 }
 
+func TestFireDueCronsDropsNamesWithNoCron(t *testing.T) {
+	ctx := context.Background()
+	q, rdb, keys := newTestQueue(t)
+	slot := currentMinute(t, q)
+	mustPutCron(t, q, CronSpec{Name: "real", Schedule: "*/1 * * * *", Job: Spec{Type: "echo"}})
+	makeDue(t, rdb, keys, "real", slot)
+	// Names left in the crons set after their hashes were deleted by hand,
+	// each due before the real cron.
+	for i := 1; i <= 5; i++ {
+		ghost := redis.Z{Score: float64(slot.Add(-time.Duration(i) * time.Minute).UnixMilli()), Member: "ghost-" + strconv.Itoa(i)}
+		if err := rdb.ZAdd(ctx, keys.Crons(), ghost).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// With room for 3 crons per call, the ghosts used to fill every call
+	// and the real cron never fired.
+	var fired []CronFire
+	for range 2 {
+		fires, err := q.FireDueCrons(ctx, 3)
+		if err != nil {
+			t.Fatalf("FireDueCrons: %v", err)
+		}
+		fired = append(fired, fires...)
+	}
+	if len(fired) != 1 || fired[0].Name != "real" {
+		t.Errorf("fires = %+v, want the real cron once", fired)
+	}
+	names, err := rdb.ZRange(ctx, keys.Crons(), 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "real" {
+		t.Errorf("crons set = %v, want only real", names)
+	}
+}
+
 func TestListCronsOrder(t *testing.T) {
 	ctx := context.Background()
 	q, _, _ := newTestQueue(t)
