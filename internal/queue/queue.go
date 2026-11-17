@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -149,6 +150,8 @@ func (s Spec) validate() error {
 		return fmt.Errorf("delay must not be negative, got %s", s.Delay)
 	case len(s.Payload) > 0 && !json.Valid(s.Payload):
 		return errors.New("payload is not valid JSON")
+	case strings.HasPrefix(s.IdempotencyKey, cronIdemPrefix):
+		return fmt.Errorf("idempotency keys starting with %q are reserved for jobs made by crons", cronIdemPrefix)
 	case s.MaxAttempts < 1:
 		return fmt.Errorf("max attempts must be at least 1, got %d", s.MaxAttempts)
 	case s.Timeout < 0:

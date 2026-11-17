@@ -40,6 +40,7 @@ The scripts live in `internal/queue/scripts/*.lua`, are embedded with `go:embed`
   - `now_ms()` — Redis `TIME`, so all nodes share one clock.
   - `lease_state()` — the fencing check, which also counts `stats.fenced`.
   - `out_of_attempts()` and `bury()`.
+  - `create_job()`, shared by `enqueue.lua` and `cron_fire.lua`.
 - **Header comment:** each script starts with one that documents `KEYS`, `ARGV` and the return codes. Keep that format.
 - **Return codes:** scripts that act for a lease holder (`complete`, `fail`, `heartbeat`, `release`) return `1` for ok, `0` when the lease was lost, and `-1` when the job was cancelled. `leaseErr` maps these to `ErrLeaseLost` / `ErrCancelled`.
 
@@ -61,16 +62,18 @@ Every key name comes from `store.Keys`, which adds an optional prefix. Productio
 | `stats`            | hash       | Counters                                   |
 | `scheduler:leader` | string     | The leading scheduler's ID                 |
 | `scheduler:epoch`  | counter    | Leadership term number                     |
+| `cron:{name}`      | hash       | A cron: schedule, job template, `next_run` |
+| `crons`            | sorted set | Cron names, scored by next slot in ms      |
 
 Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that reports a duration Redis will use truncates it to milliseconds.
 
 ### Who runs which script
 
-- **Clients** (the Phase 8 API/CLI, tests for now): `enqueue`, `cancel`, `replay`.
+- **Clients** (the Phase 8 API/CLI, tests for now): `enqueue`, `cancel`, `replay`, and `cron_put`, `cron_enable`, `cron_delete`.
 - **Workers** (`internal/worker`, `cmd/worker`):
   - `claim` and `heartbeat`.
   - Then one of `complete`, `fail` or `release`.
-- **The elected scheduler leader only** (`internal/scheduler`, `cmd/scheduler`): `promote` (scheduled → ready) and `reap` (expired lease → ready, or the dead-letter queue when out of attempts). A worker alone never promotes or reaps, so delayed jobs and crash recovery need a scheduler running.
+- **The elected scheduler leader only** (`internal/scheduler`, `cmd/scheduler`): `promote` (scheduled → ready), `reap` (expired lease → ready, or the dead-letter queue when out of attempts), and `cron_due` + `cron_fire`. A worker alone never promotes, reaps or fires crons, so delayed jobs, crash recovery and crons need a scheduler running.
 
 ### Lifecycle and retries
 
@@ -79,6 +82,12 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
 - **Permanent failures:** a handler returns `job.Permanent(err)` to skip retries.
 - **Reaper:** requeues immediately, with no backoff and with the original `run_at` as the score. That keeps worker-failure recovery under 2 s. It still enforces `max_attempts`.
 - **Release:** a worker that is shut down mid-job calls `release.lua`. It puts the job back in `ready` and gives back the attempt.
+
+### Crons (`internal/queue/cron.go`, `schedule.go`)
+
+- **One job per slot:** `cron_fire.lua` compares the cron's `next_run` (plus `enabled` and `schedule`) with what the caller read. Only if they match does it move `next_run` on and create the job, with idempotency key `cron:{name}:{slot ms}`. There is no separate `cron:fired:` key. `Enqueue` rejects client keys starting with `cron:`.
+- **Next slot:** Go computes it with robfig's standard parser, always from Redis time passed in as UTC. `CRON_TZ=` picks another zone. A cron that fell behind fires once for its oldest missed slot, then skips to its first slot after now (`nextFire`).
+- **Disabled:** `next_run` is `0` and the score in `crons` is `+inf`. Saving or re-enabling a cron restarts its schedule from now.
 
 ### Worker pool (`internal/worker/worker.go`)
 

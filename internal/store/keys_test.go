@@ -17,6 +17,9 @@ func TestKeys(t *testing.T) {
 			k.Stats():            "stats",
 			k.Leader():           "scheduler:leader",
 			k.Epoch():            "scheduler:epoch",
+			k.Cron("nightly"):    "cron:nightly",
+			k.CronPrefix():       "cron:",
+			k.Crons():            "crons",
 		}
 		for got, want := range tests {
 			if got != prefix+want {

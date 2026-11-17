@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 5 is done. Schedulers elect a leader through Redis, and only the leader releases delayed jobs and takes jobs back from dead workers. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 6: cron schedules.
+**Status:** Phase 6 is done. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 7: stats, events and the worker registry.
 
 ## Prerequisites
 
@@ -13,14 +13,14 @@ A fault-tolerant job scheduler in Go and Redis, with leader election, distribute
 
 ```bash
 make redis-up        # Redis in Docker, AOF on
-make run-scheduler   # releases delayed jobs and reclaims jobs from dead workers
+make run-scheduler   # releases delayed jobs, reclaims jobs from dead workers, fires crons
 make run-worker      # claims and runs jobs; Ctrl-C to stop
 make test            # Redis tests skip if Redis isn't running
 ```
 
-Workers need a scheduler running: without one, delayed jobs never fall due and a dead worker's jobs are never taken back. Start a second scheduler in another terminal for failover.
+Workers need a scheduler running: without one, delayed jobs never fall due, a dead worker's jobs are never taken back, and crons never fire. Start a second scheduler in another terminal for failover.
 
-Run `make help` for every target. There's no submit command until Phase 8. To watch jobs run end to end, run these tests, which print their timings:
+Run `make help` for every target. There's no command to submit a job or add a cron until Phase 8. To watch jobs run end to end, run these tests, which print their timings:
 
 ```bash
 go test -v -run TestPoolRunsImmediateAndDelayedJobs ./internal/worker/
@@ -36,6 +36,10 @@ go test -v -run TestPoolPicksUpJobFromCrashedWorker ./internal/worker/
 
 ```bash
 go test -v -run TestPoolRetriesFailedJobWithGrowingDelays ./internal/worker/
+```
+
+```bash
+go test -v -run TestFailoverFiresEachCronSlotOnce ./internal/scheduler/
 ```
 
 ## How a job flows
@@ -63,6 +67,18 @@ Any number of schedulers can run, but only one leads at a time. Leadership is th
 - **release.lua** gives the seat up on shutdown, so another scheduler takes over in about 250ms instead of waiting for the term to expire.
 
 If the leader dies, its key expires and another scheduler takes over within about 3 seconds. A leader that was only paused can wake up still believing it leads, and run one more step before its renewal fails. That is harmless: every step is an atomic Lua script that checks each job's state, so running it twice changes nothing.
+
+## Cron schedules
+
+A cron is a job template plus a schedule. The leading scheduler checks every 100ms for crons that are due, and makes exactly one job for each scheduled time, called a slot.
+
+- **Schedule:** a standard five-field expression such as `*/5 * * * *`, or a shorthand such as `@hourly` or `@every 30s`. It is read in UTC unless it starts with a zone, as in `CRON_TZ=Asia/Kolkata 0 9 * * *`.
+- **Job:** the same options as any other job: type, payload, `MaxAttempts`, `Timeout` and `Backoff`. Each job's `run_at` is its slot, and its idempotency key is `cron:{name}:{slot in ms}`.
+- **One job per slot:** **cron_fire.lua** creates the slot's job and moves the cron on to its next slot in one atomic step. It does this only if the cron is still waiting for that slot. So two schedulers racing for a slot, or a paused leader that wakes up after its successor fired one, can't make a second job.
+- **Missed slots:** a cron that fell behind, because no scheduler was running, fires once for its oldest missed slot and then skips to its first slot after now. It doesn't make a job for every slot it missed.
+- **Changes:** saving a cron under a name that exists replaces it and restarts its schedule from now. A disabled cron never fires. When turned back on, it restarts from now too, so the slots it missed while off never run.
+
+Crons are stored in a `cron:{name}` hash each, with every name in the `crons` sorted set, scored by its next slot. Phase 8 puts an API and a CLI in front of `queue.PutCron`, `ListCrons`, `SetCronEnabled` and `DeleteCron`.
 
 ## Delivery
 

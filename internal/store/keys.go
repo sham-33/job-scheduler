@@ -48,3 +48,15 @@ func (k Keys) Leader() string { return k.prefix + "scheduler:leader" }
 // Epoch counts leadership terms. Every new term, even one won by the same
 // scheduler again, gets the next number.
 func (k Keys) Epoch() string { return k.prefix + "scheduler:epoch" }
+
+// Cron is the hash holding one cron: its schedule, the template for the jobs
+// it creates, and when it fires next.
+func (k Keys) Cron(name string) string { return k.CronPrefix() + name }
+
+// CronPrefix is passed to Lua scripts that build cron keys from the names
+// they read off the crons set.
+func (k Keys) CronPrefix() string { return k.prefix + "cron:" }
+
+// Crons is a sorted set of every cron's name, scored by its next fire time
+// (ms). A disabled cron scores +inf, so it never comes due.
+func (k Keys) Crons() string { return k.prefix + "crons" }
