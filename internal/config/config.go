@@ -39,6 +39,13 @@ type Config struct {
 	// ShutdownGrace is how long running jobs get to finish after a worker is
 	// told to stop. Zero cancels them immediately.
 	ShutdownGrace time.Duration
+
+	// LeaderTTL is how long a scheduler stays leader without renewing. It
+	// bounds failover: if the leader dies, another scheduler takes over
+	// within about LeaderTTL.
+	LeaderTTL time.Duration
+	// LeaderRenewEvery is how often the leader renews its leadership.
+	LeaderRenewEvery time.Duration
 }
 
 // Load reads the environment, applies defaults and validates the result.
@@ -57,6 +64,9 @@ func Load() (Config, error) {
 		HeartbeatEvery: e.duration("HEARTBEAT_EVERY", 500*time.Millisecond),
 		ReapEvery:      e.duration("REAP_EVERY", 200*time.Millisecond),
 		ShutdownGrace:  e.duration("SHUTDOWN_GRACE", 5*time.Second),
+
+		LeaderTTL:        e.duration("LEADER_TTL", 3*time.Second),
+		LeaderRenewEvery: e.duration("LEADER_RENEW_EVERY", time.Second),
 	}
 	if err := errors.Join(append(e.errs, cfg.validate()...)...); err != nil {
 		return Config{}, fmt.Errorf("invalid config: %w", err)
@@ -73,9 +83,11 @@ func (c Config) validate() []error {
 		errs = append(errs, fmt.Errorf("CONCURRENCY must be at least 1, got %d", c.Concurrency))
 	}
 	for name, d := range map[string]time.Duration{
-		"LEASE_TTL":       c.LeaseTTL,
-		"HEARTBEAT_EVERY": c.HeartbeatEvery,
-		"REAP_EVERY":      c.ReapEvery,
+		"LEASE_TTL":          c.LeaseTTL,
+		"HEARTBEAT_EVERY":    c.HeartbeatEvery,
+		"REAP_EVERY":         c.ReapEvery,
+		"LEADER_TTL":         c.LeaderTTL,
+		"LEADER_RENEW_EVERY": c.LeaderRenewEvery,
 	} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", name, d))
@@ -88,6 +100,11 @@ func (c Config) validate() []error {
 	// round trip would make a healthy worker lose its job.
 	if c.HeartbeatEvery > 0 && c.HeartbeatEvery*2 > c.LeaseTTL {
 		errs = append(errs, fmt.Errorf("HEARTBEAT_EVERY (%s) must be at most half of LEASE_TTL (%s)", c.HeartbeatEvery, c.LeaseTTL))
+	}
+	// The same goes for the leader: one slow renewal must not cost it the
+	// leadership.
+	if c.LeaderRenewEvery > 0 && c.LeaderRenewEvery*2 > c.LeaderTTL {
+		errs = append(errs, fmt.Errorf("LEADER_RENEW_EVERY (%s) must be at most half of LEADER_TTL (%s)", c.LeaderRenewEvery, c.LeaderTTL))
 	}
 	return errs
 }

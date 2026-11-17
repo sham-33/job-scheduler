@@ -40,3 +40,11 @@ func (k Keys) Idempotency(key string) string { return k.prefix + "idem:" + key }
 
 // Stats is a hash of counters such as submitted, claimed and succeeded.
 func (k Keys) Stats() string { return k.prefix + "stats" }
+
+// Leader holds the ID of the scheduler that currently leads. It expires
+// unless the leader keeps renewing it.
+func (k Keys) Leader() string { return k.prefix + "scheduler:leader" }
+
+// Epoch counts leadership terms. Every new term, even one won by the same
+// scheduler again, gets the next number.
+func (k Keys) Epoch() string { return k.prefix + "scheduler:epoch" }

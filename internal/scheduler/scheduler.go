@@ -1,13 +1,26 @@
 // Package scheduler holds the housekeeping loops that keep jobs moving:
 // releasing delayed jobs when they fall due, and reclaiming jobs from dead
-// workers.
+// workers. The scheduler service runs them only while it is the elected
+// leader (see package election).
 package scheduler
 
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
+
+	"github.com/sham-33/job-scheduler/internal/queue"
 )
+
+// Lead runs every housekeeping loop until ctx is cancelled, which happens
+// when this scheduler stops being the leader.
+func Lead(ctx context.Context, q *queue.Queue, reapEvery time.Duration, logger *slog.Logger) {
+	var wg sync.WaitGroup
+	wg.Go(func() { RunPromoter(ctx, q, logger) })
+	wg.Go(func() { RunReaper(ctx, q, reapEvery, logger) })
+	wg.Wait()
+}
 
 // batchSize is the most jobs one step of a loop handles at a time.
 const batchSize = 1000
