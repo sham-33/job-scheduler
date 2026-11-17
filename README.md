@@ -47,6 +47,8 @@ Each step is one Lua script in [internal/queue/scripts](internal/queue/scripts),
 6. **fail.lua** records a failed attempt, with the same token check. The job goes back to `jobs:scheduled` to wait for its retry. If it is out of attempts, or the failure is permanent, it goes to `jobs:dlq`, the dead-letter queue.
 7. **reap.lua** (every 200ms) finds leases nobody renewed and puts those jobs back in `jobs:ready`, ahead of newer work and with no wait, so another worker can take over. A job that has used up its attempts goes to the dead-letter queue instead.
 
+A worker that is told to stop gets `SHUTDOWN_GRACE` to finish its jobs. It then cancels what is left, and **release.lua** puts each of those jobs straight back in `jobs:ready`. Being interrupted isn't the job's fault, so that attempt doesn't count against it.
+
 Two more scripts act on a job from outside. **cancel.lua** stops a job that hasn't finished, and a worker running it finds out at its next heartbeat. **replay.lua** moves a dead job back to `jobs:ready` with its attempts reset.
 
 Delivery is **at-least-once**: a job that fails, or whose worker dies, runs again, so handlers should be safe to repeat. Fencing guarantees only one attempt's result is ever recorded.
@@ -80,6 +82,8 @@ The `http` type sends `body` as JSON (`POST` unless `method` says otherwise) wit
 | 2xx                                         | Succeeded                         |
 | 5xx, 408, 429, a network error or a timeout | Retried with backoff              |
 | Anything else                               | Straight to the dead-letter queue |
+
+A call is limited by the job's `Timeout`, or by 30 seconds if the job has none. Error messages name only the address's scheme and host, because webhook URLs often carry a secret in the path or query string.
 
 It does not sign requests or block internal addresses, which a hosted service would need.
 

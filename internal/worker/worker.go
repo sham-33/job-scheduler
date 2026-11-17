@@ -67,8 +67,10 @@ func NewPool(opts Options, q *queue.Queue, handlers Handlers, logger *slog.Logge
 
 // Run claims and runs jobs until ctx is cancelled. It then stops claiming,
 // gives running jobs ShutdownGrace to finish, and cancels whatever is left.
-// A job still running when Run returns keeps its lease until it expires,
-// after which the reaper hands it to another worker.
+// A cancelled job goes straight back to the ready set, and the attempt it
+// was on doesn't count. A job whose handler ignores cancellation, and is
+// still running when Run returns, keeps its lease until it expires, after
+// which the reaper hands it to another worker.
 func (p *Pool) Run(ctx context.Context) {
 	// Jobs deliberately outlive ctx, so that shutting down stops new work
 	// first and only interrupts running work once the grace period is over.
@@ -155,9 +157,8 @@ func (p *Pool) process(jobsCtx context.Context, j *job.Job) {
 	case err == nil:
 		p.succeed(recCtx, j, logger)
 	case jobsCtx.Err() != nil:
-		// Shutdown interrupted the job, which is not the job's fault. Its
-		// lease expires and the reaper hands it to another worker right away.
-		logger.Warn("job interrupted by shutdown; another worker will take it")
+		// Shutdown interrupted the job, which is not the job's fault.
+		p.release(recCtx, j, logger)
 	case timedOut:
 		p.fail(recCtx, j, fmt.Errorf("timed out after %s", j.Timeout), logger)
 	default:
@@ -188,6 +189,21 @@ func (p *Pool) fail(ctx context.Context, j *job.Job, cause error, logger *slog.L
 		logger.Error("job failed for good, moved to dead-letter queue", "err", cause)
 	default:
 		logger.Warn("job failed, will retry", "err", cause, "retry_in", retryIn)
+	}
+}
+
+// release gives an interrupted job back so another worker can start it right
+// away, with the attempt not counted.
+func (p *Pool) release(ctx context.Context, j *job.Job, logger *slog.Logger) {
+	switch err := p.queue.Release(ctx, j); {
+	case errors.Is(err, queue.ErrLeaseLost), errors.Is(err, queue.ErrCancelled):
+		logger.Warn("job interrupted by shutdown; release rejected", "reason", err)
+	case err != nil:
+		// The lease will expire and the reaper will hand the job out again,
+		// though that attempt then counts against it.
+		logger.Error("job interrupted by shutdown; could not release it", "err", err)
+	default:
+		logger.Warn("job interrupted by shutdown; released for another worker")
 	}
 }
 

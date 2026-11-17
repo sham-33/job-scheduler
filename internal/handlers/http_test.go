@@ -160,3 +160,54 @@ func TestHTTPBadPayload(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPJobTimeoutReplacesDefaultLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+	const limit = 100 * time.Millisecond // stands in for the 30s default
+
+	// A job with a longer timeout of its own gets all of it.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := callHTTP(ctx, httpJob(t, HTTPPayload{URL: srv.URL}), limit); err != nil {
+		t.Errorf("job with a 2s timeout: %v, want success", err)
+	}
+
+	// A job without one is cut off at the default, and retried.
+	err := callHTTP(context.Background(), httpJob(t, HTTPPayload{URL: srv.URL}), limit)
+	if !errors.Is(err, context.DeadlineExceeded) || job.IsPermanent(err) {
+		t.Errorf("job with no timeout = %v, want a retryable deadline error", err)
+	}
+}
+
+func TestHTTPErrorsHideSecretsInURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+
+	for name, base := range map[string]string{"error reply": srv.URL, "no server": closed.URL} {
+		host := strings.TrimPrefix(base, "http://")
+		// The secret is in the user info, the path and the query, as webhook URLs have it.
+		u := "http://user:pass-s3cr3t@" + host + "/hooks/T0/path-s3cr3t?token=query-s3cr3t"
+		err := HTTP(context.Background(), httpJob(t, HTTPPayload{URL: u}))
+		if err == nil {
+			t.Fatalf("%s: HTTP succeeded, want an error", name)
+		}
+		if strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("%s: error shows a secret: %v", name, err)
+		}
+		if !strings.Contains(err.Error(), "POST http://"+host) {
+			t.Errorf("%s: error %q should still name the method and host", name, err)
+		}
+	}
+
+	bad := HTTP(context.Background(), httpJob(t, HTTPPayload{URL: "ftp://x/key-s3cr3t"}))
+	if bad == nil || strings.Contains(bad.Error(), "s3cr3t") {
+		t.Errorf("bad url: error = %v, want one without the secret", bad)
+	}
+}
