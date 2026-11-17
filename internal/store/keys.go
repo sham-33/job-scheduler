@@ -60,3 +60,19 @@ func (k Keys) CronPrefix() string { return k.prefix + "cron:" }
 // Crons is a sorted set of every cron's name, scored by its next fire time
 // (ms). A disabled cron scores +inf, so it never comes due.
 func (k Keys) Crons() string { return k.prefix + "crons" }
+
+// Events is a stream with one entry for each change to a job's status,
+// capped at about the 10,000 most recent.
+func (k Keys) Events() string { return k.prefix + "events" }
+
+// Workers is a sorted set of worker process IDs, scored by when each was
+// last seen (ms).
+func (k Keys) Workers() string { return k.prefix + "workers" }
+
+// Worker is the hash describing one worker process: its concurrency, how
+// many jobs it is running and when it started.
+func (k Keys) Worker(id string) string { return k.WorkerPrefix() + id }
+
+// WorkerPrefix is passed to the Lua script that forgets long-dead workers,
+// which builds their keys from the IDs it reads off the workers set.
+func (k Keys) WorkerPrefix() string { return k.prefix + "worker:" }

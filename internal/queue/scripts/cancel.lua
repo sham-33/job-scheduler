@@ -2,13 +2,13 @@
 -- interrupted here: its worker finds out at its next heartbeat and stops.
 --
 -- KEYS[1] job hash   KEYS[2] scheduled zset   KEYS[3] ready zset
--- KEYS[4] leases zset   KEYS[5] stats hash
+-- KEYS[4] leases zset   KEYS[5] stats hash   KEYS[6] events stream
 -- ARGV[1] job id
 --
 -- Returns 1 if the job was cancelled, 0 if it had already finished, or -1 if
 -- there is no such job.
 
-local status = redis.call('HGET', KEYS[1], 'status')
+local status, job_type, owner = unpack(redis.call('HMGET', KEYS[1], 'status', 'type', 'lease_owner'))
 if not status then
   return -1
 end
@@ -21,5 +21,10 @@ redis.call('HSET', KEYS[1], 'status', 'cancelled', 'finished_at', now, 'updated_
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('ZREM', KEYS[4], ARGV[1])
-redis.call('HINCRBY', KEYS[5], 'cancelled', 1)
+-- lease_owner outlives a finished attempt, so it only names a worker that
+-- is running the job if the job is running now.
+if status ~= 'running' then
+  owner = ''
+end
+record(KEYS[5], KEYS[6], 'cancelled', ARGV[1], job_type, status, 'cancelled', owner, now)
 return 1

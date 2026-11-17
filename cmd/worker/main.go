@@ -1,6 +1,7 @@
 // Command worker claims jobs from Redis and runs up to CONCURRENCY of them at
-// once. It needs a scheduler running too: the scheduler releases delayed jobs
-// when they fall due and takes jobs back from workers that died.
+// once, and reports itself to the worker registry every second. It needs a
+// scheduler running too: the scheduler releases delayed jobs when they fall
+// due and takes jobs back from workers that died.
 package main
 
 import (

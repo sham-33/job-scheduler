@@ -76,9 +76,9 @@ The goal is the project in this resume bullet:
 | `scheduler:leader` / `scheduler:epoch` | STRING PX / INCR           | leader lease and leadership epoch                                                                                                         |
 | `cron:{name}` / `crons`                | HASH / ZSET score=next_run | cron definitions. `crons` is scored by next fire time in ms, and a disabled cron scores +inf                                              |
 | `cron:fired:{name}:{ts}`               | not built                  | not needed: the idempotency key `idem:cron:{name}:{ts}` that each fire writes does this dedupe                                            |
-| `workers`                              | ZSET score=last_seen       | worker registry                                                                                                                           |
-| `stats`                                | HASH                       | counters: submitted, succeeded, retried, dead, reclaimed…                                                                                 |
-| `events`                               | STREAM (MAXLEN ~10k)       | lifecycle events, used by the dashboard and to measure recovery time                                                                      |
+| `workers` / `worker:{id}`              | ZSET score=last_seen / HASH | worker registry. A worker's hash holds `concurrency`, `running` and `started_at` |
+| `stats`                                | HASH                       | counters, one per event kind (submitted, promoted, claimed, succeeded, retried, dead, reclaimed, released, cancelled, replayed), plus fenced and cron_fired |
+| `events`                               | STREAM (MAXLEN ~10k)       | one entry per job status change: event, job_id, type, from, to, worker, ts. Used by the dashboard and to measure recovery time |
 
 All timestamps inside scripts come from `redis.call('TIME')`, so every node agrees on the clock.
 
@@ -343,7 +343,46 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 7: Stats, events, and the worker registry
+## Phase 7: Stats, events, and the worker registry ✅ done
+
+**As built:**
+
+- **One helper does both.** `record()` in `lib.lua` adds 1 to the counter named after the event and XADDs the event, inside the script that makes the change. Every status change goes through it, so for each event kind the number of events equals its counter, until the stream trims. The new counter is `promoted`. `fenced` and `cron_fired` stay counters with no events.
+- **Fields:** `event, job_id, type, from, to, worker, ts`.
+  - `event` was added: `from` and `to` alone can't tell `reclaimed` from `released`, which both go `running → ready`.
+  - `type` is the job's type, as in the job hash.
+  - `worker` is the lease owner, `<worker id>/<slot>`. For `reclaimed`, it is the owner whose lease expired.
+  - `ts` is Redis time in ms.
+  - A cron's job records `submitted`, like a client's.
+- **No events** for heartbeats or fenced results, since neither changes a job's status.
+- **Registry:**
+  - `worker_beat.lua`, on Redis time, ZADDs `workers` and refreshes `worker:{id}` (`concurrency`, `running`, `started_at`).
+  - Every beat also forgets workers unseen for 10 minutes (ZREM and DEL, up to 100 a beat). A worker that stops cleanly calls `RemoveWorker`, so a dead entry means a crash.
+  - The pool beats on a context detached from `Run`'s, so a draining worker stays alive through its grace period.
+  - A restarted process that reuses its ID resets `started_at` on its first beat.
+  - Constants: `worker.DefaultBeatEvery` 1 s (`Options.BeatEvery`), `events.DeadAfter` 5 s and `queue.ForgetWorkersAfter` 10 min. No new environment variables.
+- **Writes in `queue`, reads in `events`.** The registry's writes are `queue.BeatWorker` and `RemoveWorker`, so the pool still reaches Redis only through the queue.
+- **`events.Reader` only reads:**
+  - `Snapshot(ctx, recent)` reads stats, queue depths (scheduled, ready, running = `jobs:leases`, dead = `jobs:dlq`), leader, epoch, the workers set and the latest events in one `MULTI`/`EXEC`, then each worker's hash in one more pipelined round trip.
+  - `Stats`, `Depths`, `Leader`, `Workers` and `Recent` read one part each, through the same code.
+  - The structs carry JSON tags for Phase 8.
+
+**Measured with real processes** (2 schedulers, 2 workers with `CONCURRENCY=4`, default settings, 40 `sleep` jobs of 2 s):
+
+| Fault (UTC)                                         | What the snapshots showed                                                                             |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `kill -9` worker w1 at 10:59:11.922, 4 jobs running | 4 `reclaimed` events, each naming its `w1/<slot>`, 1.06 s (one) and 1.26 s (three) after the kill     |
+|                                                     | w1 shown dead 5.03 s after its last beat (4.38 s after the kill), and still listed as dead at the end |
+| `kill -9` leader s1 at 10:59:15.966                 | s2 leading, epoch 2, 2.71 s later                                                                     |
+| `SIGTERM` to the idle worker w2 at 10:59:28.549     | w2 exited in 21 ms and was gone from the registry 81 ms after the signal                              |
+
+- **Consistency:** all 40 jobs succeeded. The whole stream held 128 events: 40 `submitted`, 44 `claimed`, 40 `succeeded` and 4 `reclaimed`, each equal to its counter, with `fenced` 0. For every job, each event's `from` matched the previous event's `to`, from `submitted` to `succeeded`.
+- **Cost:** 3 more `XADD`s per job. `TestPoolRunsEveryJobExactlyOnce` (10,000 jobs, 25 slots, no `-race`, 3 runs each) went from 12,150–12,240 to 10,820–11,050 jobs/s, about 11% fewer.
+- **Stream cap:** after 12,001 events, the stream held 10,027.
+- **Integration test** (`TestCountersAndEventsFollowJobs`): an elected scheduler, a worker pool and a crashed worker ran 29 jobs through every path in about 0.4 s. The test took 34–35 snapshots. In each one, the counters equalled the events it held, and nothing went backwards between snapshots. The snapshots saw `succeeded` take 11–14 values on its way up.
+- **Deliberate code breaks:** 23 in a throwaway copy; the tests caught 22.
+  - At first they caught 21. The restarted-worker test left behind a worker last seen so long ago that the beat forgot it, which hid the bug. The test now backdates it by seconds.
+  - The 23rd, a plain pipeline in place of `MULTI`/`EXEC` in `Snapshot`, passed 40 runs of the flow test. Redis runs every command it reads from one client in one go, so a small pipeline happens not to interleave. `MULTI`/`EXEC` makes it a guarantee instead.
 
 1. Each script XADDs an `events` entry (`MAXLEN ~10000`) with `job_id, type, from, to, worker, ts`.
 2. Workers run `ZADD workers now <id>` every 1 s. A worker unseen for more than 5 s counts as dead.

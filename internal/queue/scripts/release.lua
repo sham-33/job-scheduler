@@ -4,6 +4,7 @@
 -- fencing token can release a job.
 --
 -- KEYS[1] job hash   KEYS[2] leases zset   KEYS[3] ready zset   KEYS[4] stats hash
+-- KEYS[5] events stream
 -- ARGV[1] job id     ARGV[2] fencing token from the claim
 --
 -- Returns 1 if the job was released, 0 if the caller no longer holds the
@@ -17,11 +18,12 @@ elseif state ~= 'ok' then
 end
 
 local now = now_ms()
+local job_type, owner = unpack(redis.call('HMGET', KEYS[1], 'type', 'lease_owner'))
 redis.call('HSET', KEYS[1], 'status', 'ready', 'updated_at', now)
 redis.call('HINCRBY', KEYS[1], 'attempts', -1)
 redis.call('ZREM', KEYS[2], ARGV[1])
 -- Like a reclaimed job, it keeps its original run_at, so it goes ahead of
 -- newer work.
 redis.call('ZADD', KEYS[3], redis.call('HGET', KEYS[1], 'run_at'), ARGV[1])
-redis.call('HINCRBY', KEYS[4], 'released', 1)
+record(KEYS[4], KEYS[5], 'released', ARGV[1], job_type, 'running', 'ready', owner, now)
 return 1

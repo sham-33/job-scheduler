@@ -6,7 +6,7 @@
 -- ever act on it.
 --
 -- KEYS[1] leases zset   KEYS[2] ready zset   KEYS[3] dead-letter zset
--- KEYS[4] stats hash
+-- KEYS[4] stats hash   KEYS[5] events stream
 -- ARGV[1] job key prefix   ARGV[2] max jobs to take back
 --
 -- Returns the number of jobs taken back.
@@ -18,17 +18,20 @@ local expired = redis.call('ZRANGE', KEYS[1], '-inf', now, 'BYSCORE',
 local taken = 0
 for _, id in ipairs(expired) do
   local key = ARGV[1] .. id
-  local status, run_at = unpack(redis.call('HMGET', key, 'status', 'run_at'))
+  local status, run_at, job_type, owner = unpack(redis.call('HMGET', key,
+    'status', 'run_at', 'type', 'lease_owner'))
   redis.call('ZREM', KEYS[1], id)
   if status == 'running' then
     if out_of_attempts(key) then
-      bury(key, KEYS[3], KEYS[4], id, 'lease expired', now)
+      bury(key, KEYS[3], KEYS[4], KEYS[5], id, job_type, owner, 'lease expired', now)
     else
       redis.call('HSET', key, 'status', 'ready', 'last_error', 'lease expired', 'updated_at', now)
       -- No backoff, and scoring by the original run_at puts the job ahead of
       -- newer work. Both keep recovery from a dead worker fast.
       redis.call('ZADD', KEYS[2], run_at, id)
-      redis.call('HINCRBY', KEYS[4], 'reclaimed', 1)
+      -- worker names the owner whose lease expired, so the event shows
+      -- which worker the job was taken back from.
+      record(KEYS[4], KEYS[5], 'reclaimed', id, job_type, 'running', 'ready', owner, now)
     end
     taken = taken + 1
   end

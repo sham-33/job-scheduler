@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 6 is done. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 7: stats, events and the worker registry.
+**Status:** Phase 7 is done. Every job change is counted in `stats` and recorded in an `events` stream by the same atomic script that makes it, workers report themselves to a registry every second, and `internal/events` reads it all back in one consistent snapshot. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 8: the HTTP API and the `jobctl` CLI.
 
 ## Prerequisites
 
@@ -42,6 +42,10 @@ go test -v -run TestPoolRetriesFailedJobWithGrowingDelays ./internal/worker/
 go test -v -run TestFailoverFiresEachCronSlotOnce ./internal/scheduler/
 ```
 
+```bash
+go test -v -run TestCountersAndEventsFollowJobs ./internal/events/
+```
+
 ## How a job flows
 
 Each step is one Lua script in [internal/queue/scripts](internal/queue/scripts), so Redis runs it atomically.
@@ -57,6 +61,8 @@ Each step is one Lua script in [internal/queue/scripts](internal/queue/scripts),
 A worker that is told to stop gets `SHUTDOWN_GRACE` to finish its jobs. It then cancels what is left, and **release.lua** puts each of those jobs straight back in `jobs:ready`. Being interrupted isn't the job's fault, so that attempt doesn't count against it.
 
 Two more scripts act on a job from outside. **cancel.lua** stops a job that hasn't finished, and a worker running it finds out at its next heartbeat. **replay.lua** moves a dead job back to `jobs:ready` with its attempts reset.
+
+Each of these scripts also counts and records the change it makes. See [Stats, events and workers](#stats-events-and-workers).
 
 ## Leader election
 
@@ -79,6 +85,39 @@ A cron is a job template plus a schedule. The leading scheduler checks every 100
 - **Changes:** saving a cron under a name that exists replaces it and restarts its schedule from now. A disabled cron never fires. When turned back on, it restarts from now too, so the slots it missed while off never run.
 
 Crons are stored in a `cron:{name}` hash each, with every name in the `crons` sorted set, scored by its next slot. Phase 8 puts an API and a CLI in front of `queue.PutCron`, `ListCrons`, `SetCronEnabled` and `DeleteCron`.
+
+## Stats, events and workers
+
+Every script that changes a job's status also adds 1 to a counter in the `stats` hash and appends an entry to the `events` stream, in the same atomic step. So the counters and the stream always agree with the jobs and with each other.
+
+| Event       | Status change                       | Script                     | `worker` field                                  |
+| ----------- | ----------------------------------- | -------------------------- | ----------------------------------------------- |
+| `submitted` | new → `ready` or `scheduled`        | enqueue.lua, cron_fire.lua | empty                                           |
+| `promoted`  | `scheduled` → `ready`               | promote.lua                | empty                                           |
+| `claimed`   | `ready` → `running`                 | claim.lua                  | the worker that claimed it                      |
+| `succeeded` | `running` → `succeeded`             | complete.lua               | the worker that ran it                          |
+| `retried`   | `running` → `scheduled`             | fail.lua                   | the worker that ran it                          |
+| `dead`      | `running` → `dead`                  | fail.lua, reap.lua         | the worker that ran it, or whose lease expired  |
+| `reclaimed` | `running` → `ready`                 | reap.lua                   | the worker whose lease expired                  |
+| `released`  | `running` → `ready`                 | release.lua                | the worker that was shutting down               |
+| `cancelled` | any unfinished status → `cancelled` | cancel.lua                 | the worker running it, if it was running        |
+| `replayed`  | `dead` → `ready`                    | replay.lua                 | empty                                           |
+
+- **Fields:** each entry has `event`, `job_id`, `type` (the job's type), `from`, `to`, `worker` and `ts`. `worker` is a lease owner, `<worker id>/<slot>`, and `ts` is Redis's clock in ms.
+- **Size:** the stream keeps about the latest 10,000 entries. The counters are never trimmed.
+- **Counters without events:** `fenced` counts results rejected because the caller no longer held the lease, and `cron_fired` counts jobs made by crons.
+
+```bash
+redis-cli XREVRANGE events + - COUNT 5   # the five latest events
+redis-cli HGETALL stats
+```
+
+**Worker registry:**
+
+- **Beats:** each worker process beats every second. A beat sets its score in the `workers` sorted set to Redis's clock and updates its `worker:{id}` hash: concurrency, jobs running and start time.
+- **Dead workers:** a worker unseen for more than 5 seconds counts as dead. One that shuts down cleanly removes itself at once, so a dead entry means a crash. Beats from the other workers drop entries unseen for 10 minutes.
+
+**Reading it back:** [internal/events](internal/events) reads it all. `Snapshot` returns the counters, queue depths, the leader and its epoch, the workers, and the latest events. These are read in one `MULTI`/`EXEC`, so they agree with each other. Phase 8's `GET /stats` and Phase 9's dashboard will serve it.
 
 ## Delivery
 
@@ -124,7 +163,7 @@ Every binary reads the same environment variables. An empty variable counts as u
 
 | Variable             | Default            | Meaning                                                                    |
 | -------------------- | ------------------ | -------------------------------------------------------------------------- |
-| `NODE_ID`            | `<hostname>-<pid>` | Identifies this process in leases and logs                                 |
+| `NODE_ID`            | `<hostname>-<pid>` | Identifies this process in leases, logs and the worker registry            |
 | `LOG_LEVEL`          | `info`             | `debug`, `info`, `warn` or `error`                                         |
 | `REDIS_ADDR`         | `localhost:6379`   | Redis host and port                                                        |
 | `REDIS_PASSWORD`     | (none)             | Redis password                                                             |

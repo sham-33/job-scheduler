@@ -3,7 +3,7 @@
 -- workers calling this at the same moment can never get the same job.
 --
 -- KEYS[1] ready zset   KEYS[2] leases zset   KEYS[3] lease token counter
--- KEYS[4] stats hash
+-- KEYS[4] stats hash   KEYS[5] events stream
 -- ARGV[1] job key prefix   ARGV[2] worker id   ARGV[3] lease TTL (ms)
 --
 -- Returns the job hash as a flat field/value list, or false if none is ready.
@@ -18,14 +18,15 @@ for _ = 1, 100 do
 
   local id = popped[1]
   local key = ARGV[1] .. id
-  if redis.call('HGET', key, 'status') == 'ready' then
+  local status, job_type = unpack(redis.call('HMGET', key, 'status', 'type'))
+  if status == 'ready' then
     local now = now_ms()
     local token = redis.call('INCR', KEYS[3])
     redis.call('HSET', key, 'status', 'running', 'lease_owner', ARGV[2],
       'lease_token', token, 'started_at', now, 'updated_at', now)
     redis.call('HINCRBY', key, 'attempts', 1)
     redis.call('ZADD', KEYS[2], now + tonumber(ARGV[3]), id)
-    redis.call('HINCRBY', KEYS[4], 'claimed', 1)
+    record(KEYS[4], KEYS[5], 'claimed', id, job_type, 'ready', 'running', ARGV[2], now)
     return redis.call('HGETALL', key)
   end
 end

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sham-33/job-scheduler/internal/job"
@@ -39,7 +40,8 @@ const (
 
 // Options configures a Pool.
 type Options struct {
-	// ID names this process. A job's lease owner is "<ID>/<slot>".
+	// ID names this process in the worker registry. A job's lease owner is
+	// "<ID>/<slot>".
 	ID          string
 	Concurrency int
 	// HeartbeatEvery is how often the lease on each running job is renewed.
@@ -47,6 +49,9 @@ type Options struct {
 	// ShutdownGrace is how long running jobs get to finish after Run's
 	// context is cancelled.
 	ShutdownGrace time.Duration
+	// BeatEvery is how often the process tells the worker registry it is
+	// alive. Zero means DefaultBeatEvery.
+	BeatEvery time.Duration
 }
 
 // Pool runs up to Concurrency jobs at once in one process. Each slot is a
@@ -58,6 +63,8 @@ type Pool struct {
 	queue    *queue.Queue
 	handlers Handlers
 	logger   *slog.Logger
+	// running counts the jobs in progress, for the worker registry.
+	running atomic.Int64
 }
 
 // NewPool returns a pool that claims jobs from q.
@@ -71,11 +78,17 @@ func NewPool(opts Options, q *queue.Queue, handlers Handlers, logger *slog.Logge
 // was on doesn't count. A job whose handler ignores cancellation, and is
 // still running when Run returns, keeps its lease until it expires, after
 // which the reaper hands it to another worker.
+//
+// From start to finish, Run keeps the process in the worker registry, and it
+// takes the process out again before returning.
 func (p *Pool) Run(ctx context.Context) {
 	// Jobs deliberately outlive ctx, so that shutting down stops new work
 	// first and only interrupts running work once the grace period is over.
 	jobsCtx, cancelJobs := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelJobs()
+	// The process stays registered, as alive, until its last job is done.
+	stopBeating := p.startBeating(ctx)
+	defer stopBeating()
 
 	var slots sync.WaitGroup
 	for slot := range p.opts.Concurrency {
@@ -120,6 +133,8 @@ func (p *Pool) runSlot(claimCtx, jobsCtx context.Context, owner string) {
 }
 
 func (p *Pool) process(jobsCtx context.Context, j *job.Job) {
+	p.running.Add(1)
+	defer p.running.Add(-1)
 	logger := p.logger.With("job_id", j.ID, "type", j.Type, "attempt", j.Attempts, "owner", j.LeaseOwner)
 	// "late" is how long after its run_at the job actually started.
 	logger.Info("job started", "late", j.StartedAt.Sub(j.RunAt))

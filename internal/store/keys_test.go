@@ -20,6 +20,10 @@ func TestKeys(t *testing.T) {
 			k.Cron("nightly"):    "cron:nightly",
 			k.CronPrefix():       "cron:",
 			k.Crons():            "crons",
+			k.Events():           "events",
+			k.Workers():          "workers",
+			k.Worker("w-1"):      "worker:w-1",
+			k.WorkerPrefix():     "worker:",
 		}
 		for got, want := range tests {
 			if got != prefix+want {

@@ -39,6 +39,7 @@ The scripts live in `internal/queue/scripts/*.lua`, are embedded with `go:embed`
 - **Shared helpers:** `lib.lua` is prepended to every queue script. It provides:
   - `now_ms()` — Redis `TIME`, so all nodes share one clock.
   - `lease_state()` — the fencing check, which also counts `stats.fenced`.
+  - `record()` — counts a job's status change in `stats` under the event's name and XADDs it to `events`. Every status change goes through it.
   - `out_of_attempts()` and `bury()`.
   - `create_job()`, shared by `enqueue.lua` and `cron_fire.lua`.
 - **Header comment:** each script starts with one that documents `KEYS`, `ARGV` and the return codes. Keep that format.
@@ -64,6 +65,9 @@ Every key name comes from `store.Keys`, which adds an optional prefix. Productio
 | `scheduler:epoch`  | counter    | Leadership term number                     |
 | `cron:{name}`      | hash       | A cron: schedule, job template, `next_run` |
 | `crons`            | sorted set | Cron names, scored by next slot in ms      |
+| `events`           | stream     | One entry per job status change, ~10,000   |
+| `workers`          | sorted set | Worker IDs, scored by last beat in ms      |
+| `worker:{id}`      | hash       | A worker: concurrency, running, start time |
 
 Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that reports a duration Redis will use truncates it to milliseconds.
 
@@ -73,6 +77,7 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
 - **Workers** (`internal/worker`, `cmd/worker`):
   - `claim` and `heartbeat`.
   - Then one of `complete`, `fail` or `release`.
+  - `worker_beat` every second, and `RemoveWorker` on a clean shutdown.
 - **The elected scheduler leader only** (`internal/scheduler`, `cmd/scheduler`): `promote` (scheduled → ready), `reap` (expired lease → ready, or the dead-letter queue when out of attempts), and `cron_due` + `cron_fire`. A worker alone never promotes, reaps or fires crons, so delayed jobs, crash recovery and crons need a scheduler running.
 
 ### Lifecycle and retries
@@ -98,6 +103,13 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
   - Results are recorded on `context.WithoutCancel`.
 - **Heartbeat:** a goroutine per job renews the lease. It cancels the job's context, with the _cause_, on `ErrLeaseLost` / `ErrCancelled`, or after a full `LeaseTTL` without a successful renewal.
 - **Outcome order:** the `switch` in `process` is order-sensitive: lease lost → cancelled → success → shutdown (release) → timeout → failure.
+- **Registry:** `Run` beats from start to finish, through the grace period, on a context detached from `Run`'s, and removes the worker before returning.
+
+### Stats, events and the worker registry (`internal/events`)
+
+- **Writes:** `record()` in each job script. A change and its counter and event happen in one script, so they always agree. For each event kind, the number of events equals the counter of the same name, until the stream trims. `fenced` and `cron_fired` are counters with no events.
+- **Registry:** `worker_beat.lua` uses Redis time, and also forgets workers unseen for `queue.ForgetWorkersAfter` (10 min). Readers count a worker unseen for more than `events.DeadAfter` (5 s) as dead.
+- **Reads:** `events.Reader` only reads. `Snapshot` reads everything in one `MULTI`/`EXEC`; each worker's hash comes in a second round trip.
 
 ### Leader election (`internal/election`)
 
