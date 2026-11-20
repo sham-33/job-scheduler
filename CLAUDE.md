@@ -14,12 +14,13 @@ A distributed job scheduler in Go and Redis (module `github.com/sham-33/job-sche
 ## Commands
 
 ```bash
-make build                # go build -o bin/ ./cmd/...  (bin/worker, bin/scheduler)
+make build                # go build -o bin/ ./cmd/...  (bin/worker, bin/scheduler, bin/api, bin/jobctl)
 make test                 # go test -race ./...
 make vet                  # go vet ./...
 gofmt -l .                # must print nothing
 make run-scheduler        # go run ./cmd/scheduler
 make run-worker           # go run ./cmd/worker
+make run-api              # go run ./cmd/api (HTTP_ADDR, default :8080); ./bin/jobctl calls it
 make redis-up             # Redis 7 in Docker; a local Homebrew `redis-server` works too
 
 go test -race -count=1 -run TestName ./internal/queue/    # one test
@@ -73,7 +74,7 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
 
 ### Who runs which script
 
-- **Clients** (the Phase 8 API/CLI, tests for now): `enqueue`, `cancel`, `replay`, and `cron_put`, `cron_enable`, `cron_delete`.
+- **Clients** (`internal/api`, which `cmd/api` serves and `cmd/jobctl` calls): `enqueue`, `cancel`, `replay`, `purge`, and `cron_put`, `cron_enable`, `cron_delete`.
 - **Workers** (`internal/worker`, `cmd/worker`):
   - `claim` and `heartbeat`.
   - Then one of `complete`, `fail` or `release`.
@@ -108,6 +109,16 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
 - **Read-only, apart from the registry:** `Monitor` reads counters, queue sizes, the leader, workers and events.
 - **Registry:** `Registry.Run` checks a worker in every `BeatEvery` (1 s) via `beat.lua`. A worker is dead after `DeadAfter` (5 s) without one. The pool runs it when `worker.Options.Registry` is set, and leaves only after its jobs stop.
 - Nothing about jobs depends on the registry. Leases alone handle dead workers.
+
+### API (`internal/api`)
+
+- **Server and client together:** `server.go` serves it, `client.go` calls it, and `types.go` holds the JSON shapes both use. `jobctl` is a thin cobra wrapper over `api.Client`.
+- **Error mapping (`Server.fail`):**
+  - `queue.ErrInvalid` → 400. Validation errors in `queue` are wrapped with `invalid()`, so a new validation check must be wrapped too, or it becomes a 500.
+  - Not found → 404. Finished, not dead, or cron changed → 409.
+  - Anything else → a plain 500, with the details only in the log.
+- **Bodies:** unknown JSON fields are rejected, bodies are capped at 1 MiB, durations are strings (`"30s"`). Replies are compact JSON, so payloads come back byte for byte.
+- **Auth:** optional `API_TOKEN` bearer token. `/healthz` stays open.
 
 ### Leader election (`internal/election`)
 

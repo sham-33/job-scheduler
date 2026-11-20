@@ -33,13 +33,34 @@ const (
 // maxErrorLen caps how much of a failure message is stored on the job.
 const maxErrorLen = 1000
 
+// MaxIdempotencyKeyLen caps an idempotency key's length in bytes.
+const MaxIdempotencyKeyLen = 200
+
 var (
 	ErrNotFound  = errors.New("job not found")
 	ErrLeaseLost = errors.New("job is no longer leased to this worker")
 	ErrCancelled = errors.New("job was cancelled")
 	ErrFinished  = errors.New("job has already finished")
 	ErrNotDead   = errors.New("job is not in the dead-letter queue")
+	// ErrInvalid marks an error caused by bad input, such as a spec that
+	// fails validation, as opposed to a failure talking to Redis. Check for
+	// it with errors.Is.
+	ErrInvalid = errors.New("invalid input")
 )
+
+// invalidError is bad input. Its message is the underlying error's alone.
+type invalidError struct{ error }
+
+func (e invalidError) Is(target error) bool { return target == ErrInvalid }
+func (e invalidError) Unwrap() error        { return e.error }
+
+// invalid marks err as caused by bad input.
+func invalid(err error) error {
+	if err == nil {
+		return nil
+	}
+	return invalidError{err}
+}
 
 var (
 	//go:embed scripts/lib.lua
@@ -64,6 +85,8 @@ var (
 	replaySrc string
 	//go:embed scripts/release.lua
 	releaseSrc string
+	//go:embed scripts/purge.lua
+	purgeSrc string
 
 	enqueueScript   = newScript(enqueueSrc)
 	promoteScript   = newScript(promoteSrc)
@@ -75,6 +98,7 @@ var (
 	cancelScript    = newScript(cancelSrc)
 	replayScript    = newScript(replaySrc)
 	releaseScript   = newScript(releaseSrc)
+	purgeScript     = newScript(purgeSrc)
 )
 
 // newScript prepends the shared helpers. go-redis sends the script's SHA
@@ -150,6 +174,8 @@ func (s Spec) validate() error {
 		return fmt.Errorf("delay must not be negative, got %s", s.Delay)
 	case len(s.Payload) > 0 && !json.Valid(s.Payload):
 		return errors.New("payload is not valid JSON")
+	case len(s.IdempotencyKey) > MaxIdempotencyKeyLen:
+		return fmt.Errorf("idempotency key is %d bytes, longer than the limit of %d", len(s.IdempotencyKey), MaxIdempotencyKeyLen)
 	case strings.HasPrefix(s.IdempotencyKey, cronIdemPrefix):
 		return fmt.Errorf("idempotency keys starting with %q are reserved for jobs made by crons", cronIdemPrefix)
 	case s.MaxAttempts < 1:
@@ -169,7 +195,7 @@ func (s Spec) validate() error {
 func (q *Queue) Enqueue(ctx context.Context, s Spec) (id string, created bool, err error) {
 	s = s.withDefaults()
 	if err := s.validate(); err != nil {
-		return "", false, err
+		return "", false, invalid(err)
 	}
 	// Version 7 UUIDs start with a timestamp, so IDs sort by creation time.
 	uid, err := uuid.NewV7()
@@ -359,6 +385,69 @@ func (q *Queue) Get(ctx context.Context, id string) (*job.Job, error) {
 	}
 	return job.FromHash(fields)
 }
+
+// ListDLQ returns up to limit jobs from the dead-letter queue, the most
+// recent death first, skipping the first offset. total is how many jobs the
+// queue holds.
+func (q *Queue) ListDLQ(ctx context.Context, offset, limit int) (jobs []*job.Job, total int64, err error) {
+	if offset < 0 || limit < 1 {
+		return nil, 0, invalid(fmt.Errorf("offset must not be negative and limit must be at least 1, got %d and %d", offset, limit))
+	}
+	p := q.rdb.Pipeline()
+	ids := p.ZRevRange(ctx, q.keys.DLQ(), int64(offset), int64(offset+limit-1))
+	count := p.ZCard(ctx, q.keys.DLQ())
+	if _, err := p.Exec(ctx); err != nil {
+		return nil, 0, fmt.Errorf("list dead-letter queue: %w", err)
+	}
+	jobs = make([]*job.Job, 0, len(ids.Val()))
+	if len(ids.Val()) == 0 {
+		return jobs, count.Val(), nil
+	}
+	p = q.rdb.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(ids.Val()))
+	for i, id := range ids.Val() {
+		cmds[i] = p.HGetAll(ctx, q.keys.Job(id))
+	}
+	if _, err := p.Exec(ctx); err != nil {
+		return nil, 0, fmt.Errorf("list dead-letter queue: %w", err)
+	}
+	for _, cmd := range cmds {
+		if len(cmd.Val()) == 0 {
+			continue // purged since the IDs were read
+		}
+		j, err := job.FromHash(cmd.Val())
+		if err != nil {
+			return nil, 0, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, count.Val(), nil
+}
+
+// PurgeDLQ deletes every job in the dead-letter queue for good, with its
+// idempotency key, and returns how many it deleted. It works in batches, so
+// a job that dies while it runs may or may not be deleted.
+func (q *Queue) PurgeDLQ(ctx context.Context) (int, error) {
+	total := 0
+	for {
+		reply, err := purgeScript.Run(ctx, q.rdb, []string{q.keys.DLQ(), q.keys.Stats(), q.keys.Events()},
+			q.keys.JobPrefix(), purgeBatch, q.keys.Idempotency("")).Int64Slice()
+		if err != nil {
+			return total, fmt.Errorf("purge dead-letter queue: %w", err)
+		}
+		if len(reply) != 2 {
+			return total, fmt.Errorf("purge dead-letter queue: unexpected reply %v", reply)
+		}
+		total += int(reply[0])
+		if reply[1] < purgeBatch {
+			return total, nil
+		}
+	}
+}
+
+// purgeBatch is how many jobs one purge.lua call looks at, which keeps each
+// call short.
+const purgeBatch = 500
 
 // pairsToMap turns Redis's flat [field, value, field, value, …] reply into a map.
 func pairsToMap(pairs []string) map[string]string {

@@ -1,6 +1,6 @@
 BIN := bin
 
-.PHONY: help redis-up redis-down redis-cli build test vet tidy run-worker run-scheduler
+.PHONY: help redis-up redis-down redis-cli build test vet tidy run-worker run-scheduler run-api
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -31,3 +31,6 @@ run-worker: ## Run a worker against REDIS_ADDR (default localhost:6379)
 
 run-scheduler: ## Run a scheduler (start two for failover; one is elected leader)
 	go run ./cmd/scheduler
+
+run-api: ## Run the HTTP API on HTTP_ADDR (default :8080); use ./bin/jobctl to call it
+	go run ./cmd/api

@@ -389,7 +389,44 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 8: HTTP API and CLI
+## Phase 8: HTTP API and CLI ✅ done
+
+**As built:**
+
+- **Package layout:** `internal/api` holds the server, a Go client (`api.Client`) and the JSON types both use. `jobctl` (cobra) is a thin wrapper over the client, so the API tests exercise the client too.
+- **Routes:** the plan's routes, plus:
+  - `GET /crons/{name}`;
+  - `GET /events?after=&limit=`, oldest first, with `last_id` for paging. The dashboard and `jobctl events -f` use it.
+  - `PATCH /crons/{name}` takes `{"enabled": bool}`.
+- **Replies:**
+  - `POST /jobs` answers `201`, or `200` with the first job for a repeated `Idempotency-Key`. Keys are capped at 200 bytes.
+  - Replies are compact JSON, so payloads come back byte for byte. `jobctl` pretty-prints for people.
+  - Durations are strings (`"30s"`).
+- **Errors:**
+  - Every error is `{"error": "..."}`, including unknown routes (`404`) and wrong methods (`405` with `Allow`).
+  - Bad input is `400`: validation errors in `queue` now carry a `queue.ErrInvalid` marker, and unknown JSON fields are rejected. A body over 1 MiB is `413`.
+  - Not found is `404`. Finished, not dead, or cron changed is `409`.
+  - Anything else is a plain `500`, with the details only in the log.
+- **Auth:** optional `API_TOKEN`. When set, every request except `/healthz` needs `Authorization: Bearer <token>`, checked in constant time. Without one, the API warns at start-up, because `http` jobs make workers call any address.
+- **Dead-letter purge:** a new `purge.lua` deletes dead jobs in batches of 500, oldest first.
+  - It also deletes each job's idempotency key, if it still points at that job, so the key can be used again.
+  - Each deleted job gets a `purged` event and is counted in `stats.purged`.
+  - An entry whose job isn't dead is only dropped from the set.
+- **Middleware:** panic recovery, then one log line per request (route, status, time; health checks at debug), then the token check.
+- **New binaries and settings:** `cmd/api` (`make run-api`) and `cmd/jobctl`. New setting: `API_TOKEN`. New dependency: `github.com/spf13/cobra` v1.10.2.
+
+**Measured with real processes (2 schedulers, 2 workers × 5 slots, the API with a token, a local webhook receiver), driven only by `./bin/jobctl`: 23 of 23 checks passed:**
+
+- `/healthz` answered without a token. `jobctl` without the token got `401`.
+- A job with a repeated `--key` returned the first job's ID.
+- An `http` job delayed 3 s stayed `scheduled`, then reached the receiver once, 3,019–3,101 ms after submission over two runs. It carried `X-Job-Id`, attempt 1, and its body unchanged.
+- An `http` job whose receiver answered 500, 500, 200 succeeded on attempt 3. One that got 400 went to the DLQ after 1 attempt, showed in `dlq list`, died again after `dlq replay`, and was deleted by `dlq purge --yes`. Purge refuses without `--yes`.
+- Cancelling worked on both a scheduled and a running job. The running job's worker logged that it stopped. Cancelling again got `409`.
+- `cron add tick '@every 1s'` fired 4 times in 3.5 s. Disabled, it stopped firing. It could be enabled again and deleted.
+- `stats` showed the leader and 2 live workers. `events -f` printed a new job's `submitted` and `succeeded` events as they happened.
+- 20 deliberate code breaks in a throwaway copy:
+  - 19 were caught. Two first failed to compile, and were rewritten so they did.
+  - The one missed makes a bad-input error match every other error too. It can't change a reply, because bad input is checked first and Redis errors are never marked as bad input.
 
 **API** (`net/http` with Go 1.22+ routing):
 

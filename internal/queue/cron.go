@@ -109,18 +109,18 @@ type CronFire struct {
 // now. A replaced cron stays disabled if it was.
 func (q *Queue) PutCron(ctx context.Context, s CronSpec) (*Cron, error) {
 	if !cronNamePattern.MatchString(s.Name) {
-		return nil, fmt.Errorf("cron name %q must be 1 to 100 letters, digits, '.', '_' or '-', starting with a letter or digit", s.Name)
+		return nil, invalid(fmt.Errorf("cron name %q must be 1 to 100 letters, digits, '.', '_' or '-', starting with a letter or digit", s.Name))
 	}
 	sched, err := parseSchedule(s.Schedule)
 	if err != nil {
-		return nil, err
+		return nil, invalid(err)
 	}
 	if s.Job.Delay != 0 || s.Job.IdempotencyKey != "" {
-		return nil, errors.New("a cron's job can't have a delay or an idempotency key: the schedule sets when it runs, and each slot gets its own key")
+		return nil, invalid(errors.New("a cron's job can't have a delay or an idempotency key: the schedule sets when it runs, and each slot gets its own key"))
 	}
 	tmpl := s.Job.withDefaults()
 	if err := tmpl.validate(); err != nil {
-		return nil, err
+		return nil, invalid(err)
 	}
 	now, err := q.redisNow(ctx)
 	if err != nil {
@@ -128,7 +128,7 @@ func (q *Queue) PutCron(ctx context.Context, s CronSpec) (*Cron, error) {
 	}
 	next, err := firstFire(sched, s.Schedule, now)
 	if err != nil {
-		return nil, err
+		return nil, invalid(err)
 	}
 
 	keys := []string{q.keys.Cron(s.Name), q.keys.Crons()}

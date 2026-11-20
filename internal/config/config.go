@@ -25,6 +25,9 @@ type Config struct {
 
 	// HTTPAddr is where the API and dashboard listen.
 	HTTPAddr string
+	// APIToken, if set, must be sent as a bearer token with every API
+	// request except the health check.
+	APIToken string
 
 	// Concurrency is the number of jobs one worker process runs at once.
 	Concurrency int
@@ -59,6 +62,7 @@ func Load() (Config, error) {
 		RedisPassword:  e.str("REDIS_PASSWORD", ""),
 		RedisDB:        e.integer("REDIS_DB", 0),
 		HTTPAddr:       e.str("HTTP_ADDR", ":8080"),
+		APIToken:       e.str("API_TOKEN", ""),
 		Concurrency:    e.integer("CONCURRENCY", 25),
 		LeaseTTL:       e.duration("LEASE_TTL", 1500*time.Millisecond),
 		HeartbeatEvery: e.duration("HEARTBEAT_EVERY", 500*time.Millisecond),

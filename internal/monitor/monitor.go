@@ -31,60 +31,66 @@ const (
 	EventReleased  = "released"  // its worker shut down: running → ready
 	EventCancelled = "cancelled" // any unfinished status → cancelled
 	EventReplayed  = "replayed"  // dead → ready
+	EventPurged    = "purged"    // deleted from the dead-letter queue: dead → ''
 )
 
 // Event is one job state change.
 type Event struct {
 	// ID is the stream entry's ID. It orders events, and EventsAfter takes
 	// it to continue from where an earlier read stopped.
-	ID      string
-	At      time.Time // when it happened, on Redis's clock
-	Name    string    // one of the Event* constants
-	JobID   string
-	JobType string
-	From    string // status before; "" for a new job
-	To      string // status after
-	Attempt int    // the job's attempt count; for a change out of running, the attempt that ended
+	ID      string    `json:"id"`
+	At      time.Time `json:"at"`    // when it happened, on Redis's clock
+	Name    string    `json:"event"` // one of the Event* constants
+	JobID   string    `json:"job_id"`
+	JobType string    `json:"job_type"`
+	From    string    `json:"from"`    // status before; "" for a new job
+	To      string    `json:"to"`      // status after; "" for a purged job
+	Attempt int       `json:"attempt"` // the job's attempt count; for a change out of running, the attempt that ended
 	// Worker is the lease owner ("<process>/<slot>") for a change into or
 	// out of running. For a reclaimed job it is the worker that went silent.
-	Worker string
-	Error  string // why it failed, died or was reclaimed
+	Worker string `json:"worker,omitempty"`
+	Error  string `json:"error,omitempty"` // why it failed, died or was reclaimed
 }
 
 // Snapshot is the state of the whole cluster at one moment.
 type Snapshot struct {
-	At time.Time // Redis's clock
+	At time.Time `json:"at"` // Redis's clock
 	// Counters counts what has happened since Redis was last emptied, by
 	// name: submitted, claimed, succeeded, retried, dead, reclaimed,
-	// released, fenced, cancelled, replayed, cron_fired. A counter that has
-	// never moved is missing.
-	Counters map[string]int64
-	Queues   QueueSizes
+	// released, fenced, cancelled, replayed, purged, cron_fired. A counter
+	// that has never moved is missing.
+	Counters map[string]int64 `json:"counters"`
+	Queues   QueueSizes       `json:"queues"`
 	// Leader is the ID of the leading scheduler, or "" if none leads.
-	Leader string
+	Leader string `json:"leader"`
 	// Epoch is the number of the latest leadership term.
-	Epoch   int64
-	Workers []Worker
+	Epoch   int64    `json:"epoch"`
+	Workers []Worker `json:"workers"`
+}
+
+// Ping checks that Redis answers.
+func (m *Monitor) Ping(ctx context.Context) error {
+	return m.rdb.Ping(ctx).Err()
 }
 
 // QueueSizes counts the jobs in each queue.
 type QueueSizes struct {
-	Scheduled int64 // waiting for their run_at, including retries
-	Ready     int64 // due, waiting for a worker
-	Running   int64 // leased to a worker
-	Dead      int64 // in the dead-letter queue
+	Scheduled int64 `json:"scheduled"` // waiting for their run_at, including retries
+	Ready     int64 `json:"ready"`     // due, waiting for a worker
+	Running   int64 `json:"running"`   // leased to a worker
+	Dead      int64 `json:"dead"`      // in the dead-letter queue
 }
 
 // Worker is one worker process as it last reported itself.
 type Worker struct {
-	ID          string
-	Concurrency int
-	Busy        int
-	Draining    bool
-	StartedAt   time.Time
-	LastSeen    time.Time
+	ID          string    `json:"id"`
+	Concurrency int       `json:"concurrency"`
+	Busy        int       `json:"busy"`
+	Draining    bool      `json:"draining"`
+	StartedAt   time.Time `json:"started_at,omitzero"`
+	LastSeen    time.Time `json:"last_seen"`
 	// Alive is false once the worker has gone DeadAfter without checking in.
-	Alive bool
+	Alive bool `json:"alive"`
 }
 
 // Monitor reads the cluster's state from Redis.

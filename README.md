@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 7 is done. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 8: an HTTP API and the `jobctl` command-line tool.
+**Status:** Phase 8 is done. An HTTP API and the `jobctl` command-line tool submit, inspect and cancel jobs, manage the dead-letter queue and crons, and show stats and live events. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 9: a web dashboard.
 
 ## Prerequisites
 
@@ -15,12 +15,25 @@ A fault-tolerant job scheduler in Go and Redis, with leader election, distribute
 make redis-up        # Redis in Docker, AOF on
 make run-scheduler   # releases delayed jobs, reclaims jobs from dead workers, fires crons
 make run-worker      # claims and runs jobs; Ctrl-C to stop
+make run-api         # the HTTP API on :8080
+make build           # builds ./bin/jobctl, the command-line client, with the other binaries
 make test            # Redis tests skip if Redis isn't running
 ```
 
-Workers need a scheduler running: without one, delayed jobs never fall due, a dead worker's jobs are never taken back, and crons never fire. Start a second scheduler in another terminal for failover.
+Each `run-` target runs until Ctrl-C, so give each its own terminal. Workers need a scheduler running: without one, delayed jobs never fall due, a dead worker's jobs are never taken back, and crons never fire. Start a second scheduler for failover.
 
-Run `make help` for every target. There's no command to submit a job or add a cron until Phase 8. To watch jobs run end to end, run these tests, which print their timings:
+Then, in another terminal:
+
+```bash
+./bin/jobctl submit echo '{"hello":"world"}'        # prints the new job's ID
+./bin/jobctl get <id>                               # the job, with its status
+./bin/jobctl submit http '{"url":"https://example.com/hook","body":{"n":1}}' --delay 30s
+./bin/jobctl cron add ping '@every 1m' echo '{"from":"cron"}'
+./bin/jobctl stats                                  # leader, workers, queues and counters
+./bin/jobctl events -f                              # follow job events; Ctrl-C to stop
+```
+
+Run `make help` for every target and `./bin/jobctl --help` for every command. These tests print timings as jobs run end to end:
 
 ```bash
 go test -v -run TestPoolRunsImmediateAndDelayedJobs ./internal/worker/
@@ -80,11 +93,54 @@ A cron is a job template plus a schedule. The leading scheduler checks every 100
 
 Crons are stored in a `cron:{name}` hash each, with every name in the `crons` sorted set, scored by its next slot. Phase 8 puts an API and a CLI in front of `queue.PutCron`, `ListCrons`, `SetCronEnabled` and `DeleteCron`.
 
+## API and `jobctl`
+
+`cmd/api` serves a JSON API, and `jobctl` is its command-line client. Every reply is JSON, errors included as `{"error": "..."}`.
+
+| Request                     | `jobctl`                              | Does                                                    |
+| --------------------------- | ------------------------------------- | ------------------------------------------------------- |
+| `POST /jobs`                | `submit TYPE [PAYLOAD]`               | Submits a job: `201`, or `200` for a repeated key       |
+| `GET /jobs/{id}`            | `get ID`                              | Shows a job                                             |
+| `DELETE /jobs/{id}`         | `cancel ID`                           | Cancels a job that hasn't finished                      |
+| `GET /dlq`                  | `dlq list`                            | Lists dead jobs, the most recent first                  |
+| `POST /dlq/{id}/replay`     | `dlq replay ID`                       | Runs a dead job again, with its attempts reset          |
+| `DELETE /dlq`               | `dlq purge --yes`                     | Deletes every dead job                                  |
+| `POST /crons`               | `cron add NAME SCHEDULE TYPE [PAYLOAD]` | Saves a cron, replacing one with the same name        |
+| `GET /crons`, `/crons/{name}` | `cron list`, `cron get NAME`        | Shows crons                                             |
+| `PATCH /crons/{name}`       | `cron enable NAME`, `cron disable NAME` | Turns a cron on or off, with `{"enabled": true}`      |
+| `DELETE /crons/{name}`      | `cron rm NAME`                        | Deletes a cron                                          |
+| `GET /stats`                | `stats`                               | Leader, workers, queue sizes and counters               |
+| `GET /events`               | `events [-f]`                         | The latest events, or with `?after=ID` the next ones    |
+| `GET /healthz`              | none                                  | `200` if Redis answers, `503` if not                    |
+
+A job request looks like this. Only `type` is required, and durations are strings such as `"500ms"` or `"5m"`:
+
+```json
+{
+  "type": "http",
+  "payload": { "url": "https://example.com/hook", "body": { "n": 1 } },
+  "delay": "30s",
+  "max_attempts": 3,
+  "timeout": "10s",
+  "backoff": { "base": "1s", "max": "1m" }
+}
+```
+
+- **Idempotency:** send an `Idempotency-Key` header (`jobctl submit --key`) to make retries safe. A repeated key returns the first job with `200` instead of making a second one, for 24 hours.
+- **Errors:**
+  - A mistake in the request gets `400` with a message saying what is wrong. Unknown fields count as mistakes, so a typo such as `max_attempt` isn't silently ignored.
+  - A missing job or cron gets `404`.
+  - Cancelling a finished job, or replaying one that isn't dead, gets `409`.
+  - Anything else gets `500` with no details, and is logged.
+- **Auth:** set `API_TOKEN` and every request except `/healthz` must send `Authorization: Bearer <token>`. `jobctl` reads the same variable. Without a token, anyone who can reach the API can submit `http` jobs that call any address your workers can reach, so the API logs a warning at start-up.
+
+`jobctl` talks to `$JOBCTL_API` (default `http://localhost:8080`). Add `--json` to any command for the API's raw reply.
+
 ## Watching the cluster
 
 [internal/monitor](internal/monitor) reads three things the rest of the system writes. Phase 8's API and Phase 9's dashboard are built on it.
 
-- **Counters:** the `stats` hash counts what has happened: `submitted`, `claimed`, `succeeded`, `retried`, `dead`, `reclaimed`, `released`, `fenced`, `cancelled`, `replayed` and `cron_fired`.
+- **Counters:** the `stats` hash counts what has happened: `submitted`, `claimed`, `succeeded`, `retried`, `dead`, `reclaimed`, `released`, `fenced`, `cancelled`, `replayed`, `purged` and `cron_fired`.
 - **Events:** every script that changes a job's status also appends to the `events` stream, in the same atomic step. Each entry records the job, its type, the status it moved from and to, and the attempt number. It also records the worker for changes into or out of `running`, and the error if there is one. The stream keeps about the latest 10,000 events.
 
   | Event       | Change                                       |
@@ -99,6 +155,7 @@ Crons are stored in a `cron:{name}` hash each, with every name in the `crons` so
   | `released`  | `running` → `ready`: its worker shut down    |
   | `cancelled` | any unfinished status → `cancelled`          |
   | `replayed`  | `dead` → `ready`                             |
+  | `purged`    | `dead` → deleted                             |
 
 - **Workers:** each worker process checks in every second, recording its slots, how many jobs it is running, and whether it is shutting down. A worker that hasn't checked in for 5 seconds is listed as dead, and is dropped after an hour. A worker that shuts down cleanly removes itself once its jobs have stopped.
 
@@ -154,6 +211,7 @@ Every binary reads the same environment variables. An empty variable counts as u
 | `REDIS_PASSWORD`     | (none)             | Redis password                                                             |
 | `REDIS_DB`           | `0`                | Redis database number. Tests use DB 15                                     |
 | `HTTP_ADDR`          | `:8080`            | API and dashboard listen address                                           |
+| `API_TOKEN`          | (none)             | If set, API requests must send `Authorization: Bearer <token>`             |
 | `CONCURRENCY`        | `25`               | Jobs one worker process runs at once                                       |
 | `LEASE_TTL`          | `1500ms`           | How long a claimed job stays owned without a heartbeat                     |
 | `HEARTBEAT_EVERY`    | `500ms`            | How often a worker extends its leases. Must be at most half of `LEASE_TTL` |
