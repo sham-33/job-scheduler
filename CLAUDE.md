@@ -20,7 +20,7 @@ make vet                  # go vet ./...
 gofmt -l .                # must print nothing
 make run-scheduler        # go run ./cmd/scheduler
 make run-worker           # go run ./cmd/worker
-make run-api              # go run ./cmd/api (HTTP_ADDR, default :8080); ./bin/jobctl calls it
+make run-api              # go run ./cmd/api (HTTP_ADDR, default :8080): the API and the dashboard at /
 make redis-up             # Redis 7 in Docker; a local Homebrew `redis-server` works too
 
 go test -race -count=1 -run TestName ./internal/queue/    # one test
@@ -119,6 +119,16 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
   - Anything else → a plain 500, with the details only in the log.
 - **Bodies:** unknown JSON fields are rejected, bodies are capped at 1 MiB, durations are strings (`"30s"`). Replies are compact JSON, so payloads come back byte for byte.
 - **Auth:** optional `API_TOKEN` bearer token. `/healthz` stays open.
+
+### Dashboard (`internal/dashboard`)
+
+- **Files:** `static/index.html`, plus `static/assets/{app.js,style.css,icon.svg}`. Plain JS with no build step, embedded and served by the API at `/` and `/assets/`. Those paths need no token (`isPublic` in `api/server.go`). The page sends the token itself.
+- **Safety rules:**
+  - Data goes on the page only through `textContent` or the `el()` helper.
+  - `TestScriptNeverParsesHTML` fails on `innerHTML`, `eval` and similar.
+  - The CSP (`contentSecurityPolicy`) allows only `'self'`, so no inline scripts or styles.
+- **Checks:** run `node --check internal/dashboard/static/assets/app.js` after editing the JS.
+- **Cross-site requests:** the API wraps everything in `http.CrossOriginProtection`, so a page on another site can't make state-changing calls.
 
 ### Leader election (`internal/election`)
 

@@ -444,7 +444,40 @@ Add a `run-api` Makefile target.
 
 ---
 
-## Phase 9: Web dashboard
+## Phase 9: Web dashboard ✅ done
+
+**As built:**
+
+- **Files:** `internal/dashboard` embeds `index.html` and `assets/{app.js,style.css,icon.svg}`. It is plain JS with no dependencies or build step. The API serves it at `/` and `/assets/`, and those paths need no token. If `API_TOKEN` is set, the page asks for it once per tab (kept in `sessionStorage`) and sends it as a bearer token.
+- **Polling:** `/stats` and `/events?after=` every 1 s. `/dlq` and `/crons` every 2 s. Each poller waits for its last request to finish, so a slow API never gets overlapping requests from one page.
+- **Throughput:** computed in the browser from counter changes over 10 s, plus a 60-second sparkline of succeeded jobs per second.
+- **Extras:**
+  - Click a job ID for its full JSON.
+  - Purge all takes a second click within 4 s, instead of a browser `confirm()`.
+  - A dead worker keeps showing its last report, so you can see what it was running when it died.
+- **Security, added because a browser page is a new way in:**
+  - Data goes on the page only as text. `TestScriptNeverParsesHTML` fails if `app.js` uses `innerHTML`, `eval` or similar.
+  - Every reply carries a strict CSP (`'self'` only), `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+  - `http.CrossOriginProtection` now refuses state-changing requests a browser sends from another site, which also closes a Phase 8 gap. Before, with no `API_TOKEN`, any web page could `POST /jobs` to a local API with a plain form-style request. Non-browser clients send no `Origin` header and pass.
+- **Logging:** successful reads are now logged at debug level, since an open dashboard polls several times a second. Changes and errors stay at info and above.
+- **Fixed after trying it in the browser:**
+  - Disabling a cron moved its row to the bottom, because the API lists disabled crons last. That put a different cron's Disable button under the mouse. The page now sorts crons by name.
+  - Neither table redraws while the mouse is over it, except right after the user's own click.
+
+**Measured in Chrome against real processes (2 schedulers, 2 workers × 5 slots, the API with a token, a local webhook receiver):**
+
+- The page asked for the token, then went live: leader and term, queues, throughput, workers, counters, events, the DLQ and crons.
+- A job with type `<script>alert(1)</script>` and payload `{"x":"<b>bold</b>"}` showed as plain text in the events, the DLQ and the job details. Nothing ran, and the console had no errors.
+- 8 `http` jobs that take 30 s were running on both workers (4/5 busy each) when worker w1 was killed with `kill -9` at 16:50:27.854:
+  - 4 `reclaimed` events appeared in red at 16:50:29.294, 1.44 s after the kill, each naming the w1 slot that went silent, with "lease expired".
+  - w2 claimed the first one as attempt 2 at 16:50:29.362, 1.51 s after the kill.
+  - w1's row turned red and showed `DEAD`.
+- **Buttons:**
+  - Replay moved a dead `http` job to ready; it died again on its 400 reply.
+  - Disable and Enable switched the `@every 5s` cron, which kept its row once sorted by name.
+  - Purge all, on its second click, deleted the 3 dead jobs. Three `purged` events appeared.
+- **Not planned:** the Mac went into idle sleep for 41 s during the session. On waking, the leader's seat had expired and s2 took term 2; s1 stepped down at its next renewal. The `@every 5s` cron fired once for its oldest missed slot instead of 8 times, as designed.
+- 8 deliberate code breaks in a throwaway copy were all caught by the tests. Two first failed to compile, and were rewritten so they did. One was at first missed, because no test asked for `/assets` without a slash. That case was added.
 
 A static HTML page with vanilla JS, embedded in the API and served at `/`. It polls `/stats` every 1 s.
 

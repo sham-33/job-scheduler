@@ -377,3 +377,73 @@ func TestRedisDown(t *testing.T) {
 		t.Errorf("error %q reveals the Redis address", err)
 	}
 }
+
+func TestDashboard(t *testing.T) {
+	e := newEnv(t, api.Options{Token: "s3cret"})
+
+	// The page and its files need no token: they hold no data.
+	for path, wantType := range map[string]string{
+		"/":                 "text/html",
+		"/assets/app.js":    "text/javascript",
+		"/assets/style.css": "text/css",
+		"/assets/icon.svg":  "image/svg+xml",
+	} {
+		resp, err := http.Get(e.url + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), wantType) || len(body) == 0 {
+			t.Errorf("GET %s = %d %q (%d bytes), want 200 %s", path, resp.StatusCode, resp.Header.Get("Content-Type"), len(body), wantType)
+		}
+		if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "unsafe") {
+			t.Errorf("GET %s: Content-Security-Policy = %q", path, csp)
+		}
+		if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("GET %s: no X-Content-Type-Options: nosniff", path)
+		}
+	}
+	resp, err := http.Get(e.url + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(page), `<script src="/assets/app.js"`) {
+		t.Error("the page does not load app.js")
+	}
+
+	// No directory listings, and anything not public still needs the token.
+	for path, want := range map[string]int{"/assets/": 404, "/assets/nope.js": 404, "/stats": 401, "/index.html": 401} {
+		if code, _, _ := raw(t, "GET", e.url+path, ""); code != want {
+			t.Errorf("GET %s = %d, want %d", path, code, want)
+		}
+	}
+}
+
+func TestCrossSiteRequestsAreRefused(t *testing.T) {
+	e := newEnv(t, api.Options{}) // no token: the case this matters most for
+	body := `{"type":"echo"}`
+
+	// A page on another site posting to the API is refused, whether the
+	// browser says so with Sec-Fetch-Site or only with Origin.
+	if code, _, b := raw(t, "POST", e.url+"/jobs", body, "Sec-Fetch-Site", "cross-site"); code != http.StatusForbidden || b["error"] == nil {
+		t.Errorf("cross-site POST = %d %v, want a JSON 403", code, b)
+	}
+	if code, _, _ := raw(t, "DELETE", e.url+"/dlq", "", "Origin", "https://evil.example"); code != http.StatusForbidden {
+		t.Errorf("cross-origin DELETE = %d, want 403", code)
+	}
+	// The dashboard itself (same origin) and non-browser clients pass.
+	if code, _, _ := raw(t, "POST", e.url+"/jobs", body, "Sec-Fetch-Site", "same-origin"); code != http.StatusCreated {
+		t.Errorf("same-origin POST = %d, want 201", code)
+	}
+	if code, _, _ := raw(t, "POST", e.url+"/jobs", body); code != http.StatusCreated {
+		t.Errorf("POST with no browser headers = %d, want 201", code)
+	}
+	// Reads are allowed from anywhere; without CORS headers the other site
+	// can't read the reply anyway.
+	if code, _, _ := raw(t, "GET", e.url+"/stats", "", "Sec-Fetch-Site", "cross-site"); code != http.StatusOK {
+		t.Errorf("cross-site GET = %d, want 200", code)
+	}
+}

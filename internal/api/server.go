@@ -16,8 +16,10 @@ import (
 	"runtime/debug"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/sham-33/job-scheduler/internal/dashboard"
 	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
 )
@@ -77,13 +79,54 @@ func New(q *queue.Queue, m *monitor.Monitor, opts Options, logger *slog.Logger) 
 			}
 		})
 	}
+	page := dashboard.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, http.StatusText(http.StatusNotFound))
+	}))
+	s.mux.Handle("GET /{$}", page)
+	s.mux.Handle("GET /assets/", page)
 	return s
 }
 
-// Handler returns the API with its middleware: panic recovery, request
-// logging, the token check, and JSON replies for unknown routes.
+// contentSecurityPolicy lets the dashboard load only its own files and call
+// only this API. Even if a job's error message or a cron name held HTML, the
+// browser would refuse to run any script it smuggled in.
+const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; " +
+	"connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+// isPublic reports whether a path needs no token: the health check, and the
+// dashboard's files, which hold no data.
+func isPublic(path string) bool {
+	return path == "/healthz" || path == "/" || strings.HasPrefix(path, "/assets/")
+}
+
+// Handler returns the API and dashboard with their middleware: panic
+// recovery, request logging, security headers, cross-site request blocking,
+// the token check, and JSON replies for unknown routes.
 func (s *Server) Handler() http.Handler {
-	return s.recover(s.log(s.auth(http.HandlerFunc(s.route))))
+	return s.recover(s.log(securityHeaders(s.crossOrigin(s.auth(http.HandlerFunc(s.route))))))
+}
+
+// crossOrigin rejects state-changing requests that a browser sends from
+// another site. Without it, a web page open in the same browser could submit
+// jobs to an API on localhost, or purge its dead-letter queue, whenever no
+// API_TOKEN is set. Requests from jobctl and other non-browser clients carry
+// no Origin or Sec-Fetch-Site header and pass.
+func (s *Server) crossOrigin(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusForbidden, "cross-origin request refused")
+	}))
+	return cop.Handler(next)
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // route sends a request to its handler. ServeMux answers an unknown path or
@@ -378,7 +421,8 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // auth rejects requests without the token, if one is set. The health check
-// stays open so load balancers and orchestrators can call it.
+// stays open so load balancers and orchestrators can call it, and so do the
+// dashboard's files, which ask for the token themselves.
 func (s *Server) auth(next http.Handler) http.Handler {
 	if s.opts.Token == "" {
 		return next
@@ -386,7 +430,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	want := []byte("Bearer " + s.opts.Token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := []byte(r.Header.Get("Authorization"))
-		if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare(got, want) != 1 {
+		if !isPublic(r.URL.Path) && subtle.ConstantTimeCompare(got, want) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="job-scheduler"`)
 			writeError(w, http.StatusUnauthorized, "missing or wrong API token")
 			return
@@ -395,8 +439,9 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	})
 }
 
-// log writes one line per request. Health checks are logged at debug level,
-// since orchestrators call them every few seconds.
+// log writes one line per request. Successful reads are logged at debug
+// level: the dashboard polls several times a second, and health checks come
+// every few seconds. Changes and errors are logged at info or above.
 func (s *Server) log(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -406,7 +451,7 @@ func (s *Server) log(next http.Handler) http.Handler {
 		switch {
 		case sw.code >= 500:
 			level = slog.LevelError
-		case r.URL.Path == "/healthz":
+		case r.Method == http.MethodGet && sw.code < 400:
 			level = slog.LevelDebug
 		}
 		s.logger.Log(r.Context(), level, "request", "method", r.Method, "path", r.URL.Path,

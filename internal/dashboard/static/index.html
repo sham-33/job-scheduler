@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Job Scheduler</title>
+    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/style.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="top">
+      <h1>Job Scheduler</h1>
+      <div class="leader" id="leader">leader: –</div>
+      <div class="conn" id="conn" role="status">connecting…</div>
+    </header>
+
+    <form class="token" id="token-form" hidden>
+      <label for="token-input">This API needs a token (API_TOKEN).</label>
+      <input
+        id="token-input"
+        type="password"
+        autocomplete="off"
+        placeholder="API token"
+      />
+      <button type="submit">Use token</button>
+    </form>
+
+    <div class="notice" id="notice" role="status" hidden></div>
+
+    <main>
+      <section class="card" aria-labelledby="queues-h">
+        <h2 id="queues-h">Queues</h2>
+        <div class="tiles">
+          <div class="tile">
+            <span class="num" id="q-scheduled">–</span
+            ><span class="lbl">scheduled</span>
+          </div>
+          <div class="tile">
+            <span class="num" id="q-ready">–</span
+            ><span class="lbl">ready</span>
+          </div>
+          <div class="tile">
+            <span class="num" id="q-running">–</span
+            ><span class="lbl">running</span>
+          </div>
+          <div class="tile bad">
+            <span class="num" id="q-dead">–</span><span class="lbl">dead</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="tp-h">
+        <h2 id="tp-h">Throughput <small>last 10 s</small></h2>
+        <div class="tiles">
+          <div class="tile">
+            <span class="num" id="rate-succeeded">–</span
+            ><span class="lbl">succeeded / s</span>
+          </div>
+          <div class="tile">
+            <span class="num" id="rate-submitted">–</span
+            ><span class="lbl">submitted / s</span>
+          </div>
+          <div class="tile">
+            <span class="num" id="rate-failed">–</span
+            ><span class="lbl">failed / s</span>
+          </div>
+        </div>
+        <svg
+          class="spark"
+          id="spark"
+          viewBox="0 0 120 24"
+          preserveAspectRatio="none"
+          aria-label="succeeded per second, last 60 seconds"
+        >
+          <polyline id="spark-line" points=""></polyline>
+        </svg>
+      </section>
+
+      <section class="card wide" aria-labelledby="workers-h">
+        <h2 id="workers-h">Workers <small id="workers-sum"></small></h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Worker</th>
+              <th>State</th>
+              <th>Busy</th>
+              <th>Last seen</th>
+              <th>Started</th>
+            </tr>
+          </thead>
+          <tbody id="workers"></tbody>
+        </table>
+        <p class="empty" id="workers-empty" hidden>
+          No workers have checked in.
+        </p>
+      </section>
+
+      <section class="card wide" aria-labelledby="counters-h">
+        <h2 id="counters-h">
+          Counters <small>since Redis was last emptied</small>
+        </h2>
+        <dl class="counters" id="counters"></dl>
+      </section>
+
+      <section class="card wide" aria-labelledby="events-h">
+        <h2 id="events-h">Events <small>newest first</small></h2>
+        <div class="scroll">
+          <table class="events">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Event</th>
+                <th>Job</th>
+                <th>Type</th>
+                <th>Change</th>
+                <th>Try</th>
+                <th>Worker</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody id="events"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card wide" aria-labelledby="dlq-h">
+        <h2 id="dlq-h">Dead-letter queue <small id="dlq-sum"></small></h2>
+        <div class="actions">
+          <button type="button" class="danger" id="purge">Purge all</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Type</th>
+              <th>Attempts</th>
+              <th>Died</th>
+              <th>Last error</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="dlq"></tbody>
+        </table>
+        <p class="empty" id="dlq-empty" hidden>No dead jobs.</p>
+      </section>
+
+      <section class="card wide" aria-labelledby="crons-h">
+        <h2 id="crons-h">Crons</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Schedule</th>
+              <th>Type</th>
+              <th>Next run</th>
+              <th>Last job</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="crons"></tbody>
+        </table>
+        <p class="empty" id="crons-empty" hidden>No crons.</p>
+      </section>
+    </main>
+
+    <dialog id="job-dialog" aria-labelledby="job-title">
+      <h2 id="job-title">Job</h2>
+      <pre id="job-json"></pre>
+      <form method="dialog"><button>Close</button></form>
+    </dialog>
+  </body>
+</html>

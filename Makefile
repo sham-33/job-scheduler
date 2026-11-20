@@ -32,5 +32,5 @@ run-worker: ## Run a worker against REDIS_ADDR (default localhost:6379)
 run-scheduler: ## Run a scheduler (start two for failover; one is elected leader)
 	go run ./cmd/scheduler
 
-run-api: ## Run the HTTP API on HTTP_ADDR (default :8080); use ./bin/jobctl to call it
+run-api: ## Run the HTTP API and dashboard on HTTP_ADDR (default :8080)
 	go run ./cmd/api

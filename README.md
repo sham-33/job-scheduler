@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 8 is done. An HTTP API and the `jobctl` command-line tool submit, inspect and cancel jobs, manage the dead-letter queue and crons, and show stats and live events. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 9: a web dashboard.
+**Status:** Phase 9 is done. A web dashboard at `http://localhost:8080` shows the leader, workers, queues, throughput and a live event feed, and can replay or purge dead jobs and turn crons on and off. An HTTP API and the `jobctl` command-line tool submit, inspect and cancel jobs, manage the dead-letter queue and crons, and show stats and live events. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 10: Docker images and a 25-worker cluster in Docker Compose.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ make test            # Redis tests skip if Redis isn't running
 
 Each `run-` target runs until Ctrl-C, so give each its own terminal. Workers need a scheduler running: without one, delayed jobs never fall due, a dead worker's jobs are never taken back, and crons never fire. Start a second scheduler for failover.
 
-Then, in another terminal:
+Open `http://localhost:8080` for the dashboard. Then, in another terminal:
 
 ```bash
 ./bin/jobctl submit echo '{"hello":"world"}'        # prints the new job's ID
@@ -135,6 +135,26 @@ A job request looks like this. Only `type` is required, and durations are string
 - **Auth:** set `API_TOKEN` and every request except `/healthz` must send `Authorization: Bearer <token>`. `jobctl` reads the same variable. Without a token, anyone who can reach the API can submit `http` jobs that call any address your workers can reach, so the API logs a warning at start-up.
 
 `jobctl` talks to `$JOBCTL_API` (default `http://localhost:8080`). Add `--json` to any command for the API's raw reply.
+
+## Dashboard
+
+The API serves a dashboard at `/`: one page of plain HTML, CSS and JavaScript in [internal/dashboard](internal/dashboard), built into the binary with no build step. It reads everything from the API above, so it shows what `jobctl` shows.
+
+- **Leader and queues:** the leading scheduler and its term, and how many jobs are scheduled, ready, running and dead.
+- **Throughput:** succeeded, submitted and failed jobs per second over the last 10 s, with a 60-second sparkline.
+- **Workers:** each process with its busy slots. One that stops checking in turns red and shows `DEAD` after 5 s.
+- **Counters,** and a **live event feed**, newest first, that flags `reclaimed`, `dead`, `failed` and `released` events. Click a job ID for the whole job.
+- **Dead-letter queue:** a Replay button per job, and Purge all, which needs a second click within 4 s.
+- **Crons:** an Enable or Disable button per cron.
+
+It refreshes the numbers every second and the two tables every 2 s. A table doesn't redraw while the mouse is over it, so a row can't move just before a click lands.
+
+If `API_TOKEN` is set, the page asks for it once per browser tab and sends it as a bearer token. The page itself needs no token, since it holds no data.
+
+**Safety:**
+- Everything the page shows from the API is inserted as text, never as HTML. Job types, errors and cron names come from whoever submitted them, and a test fails if the page's code ever uses an HTML-parsing call.
+- Every reply carries a strict Content-Security-Policy: the page may run only its own script and call only this API.
+- The API refuses state-changing requests a browser sends from another site, so a web page you visit can't submit jobs to a local API that has no token.
 
 ## Watching the cluster
 
