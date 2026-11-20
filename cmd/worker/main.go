@@ -1,6 +1,10 @@
 // Command worker claims jobs from Redis and runs up to CONCURRENCY of them at
 // once. It needs a scheduler running too: the scheduler releases delayed jobs
 // when they fall due and takes jobs back from workers that died.
+//
+// `worker healthcheck` exits 0 if a worker in the same container checked in
+// with Redis within the last 5 s (it reads HEALTH_FILE), for Docker's
+// HEALTHCHECK.
 package main
 
 import (
@@ -13,6 +17,7 @@ import (
 
 	"github.com/sham-33/job-scheduler/internal/config"
 	"github.com/sham-33/job-scheduler/internal/handlers"
+	"github.com/sham-33/job-scheduler/internal/health"
 	"github.com/sham-33/job-scheduler/internal/logging"
 	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
@@ -21,6 +26,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		// A few missed check-ins are allowed, as for the worker registry.
+		health.Run(func() error { return health.CheckFile(os.Getenv("HEALTH_FILE"), monitor.DeadAfter) })
+	}
 	if err := run(); err != nil {
 		slog.Error("worker failed", "err", err)
 		os.Exit(1)
@@ -48,12 +57,14 @@ func run() error {
 
 	keys := store.Keys{}
 	q := queue.New(rdb, keys, cfg.LeaseTTL)
+	registry := monitor.NewRegistry(rdb, keys, logger)
+	registry.OnBeat(health.NewFile(cfg.HealthFile).Touch)
 	pool := worker.NewPool(worker.Options{
 		ID:             cfg.NodeID,
 		Concurrency:    cfg.Concurrency,
 		HeartbeatEvery: cfg.HeartbeatEvery,
 		ShutdownGrace:  cfg.ShutdownGrace,
-		Registry:       monitor.NewRegistry(rdb, keys, logger),
+		Registry:       registry,
 	}, q, handlers.Default(), logger)
 
 	done := make(chan struct{})

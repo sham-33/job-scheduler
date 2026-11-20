@@ -45,11 +45,18 @@ type Registry struct {
 	rdb    *redis.Client
 	keys   store.Keys
 	logger *slog.Logger
+	onBeat func()
 }
 
 // NewRegistry returns a Registry.
 func NewRegistry(rdb *redis.Client, keys store.Keys, logger *slog.Logger) *Registry {
 	return &Registry{rdb: rdb, keys: keys, logger: logger}
+}
+
+// OnBeat sets f to be called after every check-in that reached Redis. It
+// must be called before Run.
+func (r *Registry) OnBeat(f func()) {
+	r.onBeat = f
 }
 
 // Run checks in as worker id every BeatEvery, reporting status(), until ctx
@@ -66,6 +73,9 @@ func (r *Registry) Run(ctx context.Context, id string, status func() WorkerStatu
 		switch {
 		case err == nil:
 			first = false
+			if r.onBeat != nil {
+				r.onBeat()
+			}
 		case ctx.Err() == nil:
 			r.logger.Warn("worker check-in failed", "err", err)
 		}

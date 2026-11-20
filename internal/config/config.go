@@ -28,6 +28,9 @@ type Config struct {
 	// APIToken, if set, must be sent as a bearer token with every API
 	// request except the health check.
 	APIToken string
+	// HealthFile, if set, is touched each time a worker or scheduler gets
+	// through to Redis, for its `healthcheck` subcommand to read.
+	HealthFile string
 
 	// Concurrency is the number of jobs one worker process runs at once.
 	Concurrency int
@@ -63,6 +66,7 @@ func Load() (Config, error) {
 		RedisDB:        e.integer("REDIS_DB", 0),
 		HTTPAddr:       e.str("HTTP_ADDR", ":8080"),
 		APIToken:       e.str("API_TOKEN", ""),
+		HealthFile:     e.str("HEALTH_FILE", ""),
 		Concurrency:    e.integer("CONCURRENCY", 25),
 		LeaseTTL:       e.duration("LEASE_TTL", 1500*time.Millisecond),
 		HeartbeatEvery: e.duration("HEARTBEAT_EVERY", 500*time.Millisecond),
@@ -113,12 +117,16 @@ func (c Config) validate() []error {
 	return errs
 }
 
-// defaultNodeID is unique per process on one machine; inside Docker the
-// hostname is the container ID, so it is unique across the cluster too.
+// defaultNodeID is unique per process on one machine. Inside Docker the
+// hostname is the container ID, unique across the cluster, and the process
+// is pid 1, so there the hostname alone is used: it matches `docker ps`.
 func defaultNodeID() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "node"
+	}
+	if os.Getpid() == 1 {
+		return host
 	}
 	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }

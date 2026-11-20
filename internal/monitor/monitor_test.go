@@ -413,3 +413,26 @@ func TestSnapshotFollowsJobsThroughTheCluster(t *testing.T) {
 		t.Errorf("after shutdown = %+v, want no workers, no leader, epoch 1", s)
 	}
 }
+
+func TestRegistryOnBeatOnlyAfterReachingRedis(t *testing.T) {
+	rdb, keys, _ := setup(t)
+	run := func(reg *monitor.Registry) int {
+		var mu sync.Mutex
+		beats := 0
+		reg.OnBeat(func() { mu.Lock(); beats++; mu.Unlock() })
+		ctx, cancel := context.WithTimeout(context.Background(), monitor.BeatEvery+300*time.Millisecond)
+		defer cancel()
+		reg.Run(ctx, "w1", func() monitor.WorkerStatus { return monitor.WorkerStatus{Concurrency: 1} })
+		mu.Lock()
+		defer mu.Unlock()
+		return beats
+	}
+	if n := run(monitor.NewRegistry(rdb, keys, discard)); n != 2 {
+		t.Errorf("OnBeat ran %d times in 1.3 s, want 2 (at once, then after 1 s)", n)
+	}
+	broken := redis.NewClient(&redis.Options{Addr: "localhost:1", MaxRetries: -1})
+	t.Cleanup(func() { _ = broken.Close() })
+	if n := run(monitor.NewRegistry(broken, keys, discard)); n != 0 {
+		t.Errorf("OnBeat ran %d times with Redis unreachable, want 0", n)
+	}
+}

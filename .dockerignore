@@ -1,0 +1,6 @@
+# Only go.mod, go.sum, cmd/ and internal/ are needed to build the image.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

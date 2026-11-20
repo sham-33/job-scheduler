@@ -1,6 +1,9 @@
 // Command api serves the HTTP API for submitting and managing jobs and
 // crons and for watching the cluster. It holds no state of its own, so any
 // number can run behind a load balancer.
+//
+// `api healthcheck` exits 0 if the API on HTTP_ADDR answers /healthz, which
+// it does only while it can reach Redis, for Docker's HEALTHCHECK.
 package main
 
 import (
@@ -16,6 +19,7 @@ import (
 
 	"github.com/sham-33/job-scheduler/internal/api"
 	"github.com/sham-33/job-scheduler/internal/config"
+	"github.com/sham-33/job-scheduler/internal/health"
 	"github.com/sham-33/job-scheduler/internal/logging"
 	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
@@ -26,6 +30,9 @@ import (
 const shutdownGrace = 5 * time.Second
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		health.Run(checkHealth)
+	}
 	if err := run(); err != nil {
 		slog.Error("api failed", "err", err)
 		os.Exit(1)
@@ -82,4 +89,16 @@ func run() error {
 	}
 	logger.Info("shut down")
 	return nil
+}
+
+func checkHealth() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	url, err := health.LocalURL(cfg.HTTPAddr, "/healthz")
+	if err != nil {
+		return err
+	}
+	return health.CheckURL(url, 3*time.Second)
 }

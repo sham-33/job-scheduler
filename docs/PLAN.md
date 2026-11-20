@@ -487,7 +487,36 @@ Panels: leader and epoch, live workers, queue depths, counters and throughput, a
 
 ---
 
-## Phase 10: Dockerize and scale out (needs Docker Desktop)
+## Phase 10: Dockerize and scale out (needs Docker Desktop) ✅ done
+
+**As built:**
+
+- **Image:** one image for every service. A multi-stage `Dockerfile` builds static binaries (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`) on `golang:1.27-alpine`, with BuildKit cache mounts for modules and builds, and copies them onto `gcr.io/distroless/static-debian13:nonroot`. The result has no shell, runs as user `nonroot`, and is 53.8 MB. `.dockerignore` lets in only `go.mod`, `go.sum`, `cmd/` and `internal/`.
+- **Compose:**
+  - `redis` (AOF on), `api`, `scheduler` (`deploy.replicas: 2`) and `worker` (`replicas: 5`, `CONCURRENCY=5`, `SHUTDOWN_GRACE=10s`).
+  - All restart `unless-stopped` and wait for Redis to be healthy.
+  - `stop_grace_period`: worker 15 s, api 10 s, scheduler 5 s, redis 10 s.
+  - Ports are bound to `127.0.0.1`. Before, Redis listened on every interface with no password.
+  - `make up`, `make down` and `make logs`.
+- **Health checks that mean something:** each binary has a `healthcheck` subcommand (`internal/health`).
+  - Workers touch `HEALTH_FILE` after every registry check-in that reached Redis (`Registry.OnBeat`). Schedulers touch it after every acquire or renew call that got an answer (`election.Options.OnContact`), leader or not.
+  - The check fails once the file is older than 5 s, or 3 × `LEADER_RENEW_EVERY` for schedulers. So it catches a process that is stuck, or cut off from Redis, not just one that exited.
+  - The API's check calls its own `/healthz`.
+- **Node IDs:** in a container the process is pid 1, so the default `NODE_ID` is now just the hostname, the container ID, which matches `docker ps`. Outside containers it stays `<hostname>-<pid>`.
+- **Found by the Redis-restart test:** while Redis replays its AOF it answers `LOADING`, and the API turned that into a `500`. Now the API answers `503` with `Retry-After: 1` whenever Redis is unavailable: loading, refusing connections, timing out or at its client limit. Clients know to retry. Genuine internal errors stay a plain `500`.
+
+**Measured on Docker Desktop (Apple silicon), all through the API or `docker`:**
+
+- **Build:** the first build took BuildKit 8 min 18 s, mostly downloading and compiling dependencies. A cached rebuild took 5 s, and one after a code change 2 s.
+- **Start-up:** `docker compose up -d --wait` had all 9 containers healthy in 8.9 s. The API showed 1 leader and 5 live workers with 25 slots. The dashboard screenshot under load showed 25/25 slots busy at 227 jobs/s, against a ceiling of 250 for 100 ms jobs.
+- **Load:** 1,000 mixed jobs (600 `echo`, 300 `sleep` 50–200 ms, 100 `flaky p=0.3`) finished 1.9 s after the first was submitted. All 1,000 succeeded, with 37 retries.
+- **`docker kill` a worker mid-job:** its 3 jobs were `reclaimed` at +1,453 ms and claimed by other workers by +1,462 ms. The registry marked it dead. `docker start` brought it back under the same ID.
+- **`docker kill` the leading scheduler:** another took over after 3,297 ms. Delayed jobs submitted afterwards ran.
+- **`docker stop` a worker running 3 jobs of 30 s:** it stopped in 10.1 s, which is `SHUTDOWN_GRACE`. All 3 jobs were `released` with the attempt given back, the container exited with code 0 and left the registry, and a released job ran again as attempt 1 on another worker.
+- **`docker compose restart redis` with 20 delayed jobs pending:** it took 0.3 s, and all 20 jobs survived through the AOF and succeeded. One API reply during loading was `503` with `Retry-After: 1`.
+- **Redis stopped:** every scheduler, API and worker container was `unhealthy` 19–19.5 s later, which is 5 s of staleness plus 3 checks 5 s apart. The worker's check said "last in touch with Redis 20.393s ago, more than 5s". All were healthy again 4.5 s after Redis started.
+- **Docker Desktop quit unexpectedly** around a Mac sleep. On relaunch, every container came back healthy within 7 s, and Redis still held all its data.
+- 10 deliberate code breaks in a throwaway copy were all caught by the tests.
 
 1. A multi-stage `Dockerfile` that builds all binaries.
 2. Compose services: `redis`, `api`, `scheduler` ×2, and `worker` ×5 with `CONCURRENCY=5` (**25 workers**).

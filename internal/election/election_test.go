@@ -291,3 +291,36 @@ func TestLeadReturningEarlyEndsTheTerm(t *testing.T) {
 		}
 	}
 }
+
+func TestOnContactFollowsRedisContact(t *testing.T) {
+	rdb := storetest.Client(t)
+	keys := storetest.Keys(t, rdb)
+	count := func(rdb *redis.Client, id string) int {
+		var mu sync.Mutex
+		n := 0
+		e := New(rdb, keys, Options{ID: id, TTL: ttl, RenewEvery: renew, PollEvery: poll,
+			OnContact: func() { mu.Lock(); n++; mu.Unlock() }}, slog.New(slog.DiscardHandler))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*renew)
+		defer cancel()
+		e.Run(ctx, func(ctx context.Context, _ int64) { <-ctx.Done() })
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+	// As leader: the winning acquire, then a renewal every 100 ms.
+	if n := count(rdb, "a"); n < 4 || n > 6 {
+		t.Errorf("leader made contact %d times in 500 ms, want about 5", n)
+	}
+	// As follower, while someone else holds the seat: a poll every 20 ms.
+	if err := rdb.Set(context.Background(), keys.Leader(), "other", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(rdb, "b"); n < 15 {
+		t.Errorf("follower made contact %d times in 500 ms, want about 25", n)
+	}
+	broken := redis.NewClient(&redis.Options{Addr: "localhost:1", MaxRetries: -1})
+	t.Cleanup(func() { _ = broken.Close() })
+	if n := count(broken, "c"); n != 0 {
+		t.Errorf("made contact %d times with Redis unreachable, want 0", n)
+	}
+}

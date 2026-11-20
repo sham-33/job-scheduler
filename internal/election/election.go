@@ -57,6 +57,10 @@ type Options struct {
 	// PollEvery is how often a candidate that isn't leading checks whether
 	// the seat is free. Zero means RenewEvery/4.
 	PollEvery time.Duration
+	// OnContact, if set, is called after every acquire or renew call that
+	// got an answer from Redis, whatever the answer. A health check uses it
+	// to tell a working candidate from one cut off from Redis.
+	OnContact func()
 }
 
 // Elector campaigns for leadership on behalf of one process.
@@ -87,6 +91,9 @@ func New(rdb *redis.Client, keys store.Keys, opts Options, logger *slog.Logger) 
 func (e *Elector) Run(ctx context.Context, lead func(ctx context.Context, epoch int64)) {
 	for ctx.Err() == nil {
 		epoch, err := e.acquire(ctx)
+		if err == nil {
+			e.contact()
+		}
 		switch {
 		case err != nil:
 			if ctx.Err() == nil {
@@ -153,6 +160,9 @@ func (e *Elector) keepRenewing(ctx context.Context, done <-chan struct{}) error 
 		renewCtx, cancel := context.WithTimeout(ctx, e.opts.RenewEvery)
 		ok, err := e.renew(renewCtx)
 		cancel()
+		if err == nil {
+			e.contact()
+		}
 		switch {
 		case ctx.Err() != nil:
 			return context.Cause(ctx)
@@ -161,6 +171,12 @@ func (e *Elector) keepRenewing(ctx context.Context, done <-chan struct{}) error 
 		case !ok:
 			return errSeatTaken
 		}
+	}
+}
+
+func (e *Elector) contact() {
+	if e.opts.OnContact != nil {
+		e.opts.OnContact()
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"runtime/debug"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/sham-33/job-scheduler/internal/dashboard"
 	"github.com/sham-33/job-scheduler/internal/monitor"
@@ -368,10 +371,25 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case r.Context().Err() != nil:
 		// The client went away; nobody is listening for a reply.
+	case redisUnavailable(err):
+		// Not a bug, and likely to pass: say so, so clients retry.
+		s.logger.Warn("request failed: Redis unavailable", "method", r.Method, "path", r.URL.Path, "err", err)
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "Redis is unavailable; try again shortly")
 	default:
 		s.logger.Error("request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+// redisUnavailable reports whether err means Redis can't serve requests
+// right now: it is still loading its data after a restart, or it can't be
+// reached, or it didn't answer in time. Trying again shortly may work.
+func redisUnavailable(err error) bool {
+	var netErr net.Error
+	return redis.IsLoadingError(err) || redis.IsMaxClientsError(err) ||
+		errors.As(err, &netErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 // decode reads a JSON body into v. Unknown fields are rejected, so a typo

@@ -370,11 +370,32 @@ func TestRedisDown(t *testing.T) {
 	ctx := context.Background()
 
 	wantStatus(t, "health", c.Health(ctx), http.StatusServiceUnavailable, "Redis is unreachable")
-	// Internal failures don't leak details such as addresses.
+	// Redis being down is temporary, not a bug: 503, with a hint to retry,
+	// and no details such as its address.
 	_, err := c.GetJob(ctx, "x")
-	wantStatus(t, "get job", err, http.StatusInternalServerError, "internal error")
+	wantStatus(t, "get job", err, http.StatusServiceUnavailable, "Redis is unavailable; try again shortly")
 	if strings.Contains(err.Error(), "localhost:1") {
 		t.Errorf("error %q reveals the Redis address", err)
+	}
+	if _, h, _ := raw(t, "GET", srv.URL+"/stats", ""); h.Get("Retry-After") != "1" {
+		t.Errorf("Retry-After = %q, want 1", h.Get("Retry-After"))
+	}
+}
+
+func TestInternalErrorsHideDetails(t *testing.T) {
+	rdb := storetest.Client(t)
+	keys := storetest.Keys(t, rdb)
+	srv := httptest.NewServer(api.New(queue.New(rdb, keys, time.Second), monitor.New(rdb, keys),
+		api.Options{}, slog.New(slog.DiscardHandler)).Handler())
+	t.Cleanup(srv.Close)
+	// A job hash that can't be read, as if edited by hand.
+	if err := rdb.HSet(context.Background(), keys.Job("broken"), "id", "broken", "attempts", "many").Err(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := api.NewClient(srv.URL, "").GetJob(context.Background(), "broken")
+	wantStatus(t, "unreadable job", err, http.StatusInternalServerError, "internal error")
+	if strings.Contains(err.Error(), "many") {
+		t.Errorf("error %q reveals internal details", err)
 	}
 }
 

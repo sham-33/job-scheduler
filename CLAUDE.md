@@ -22,6 +22,7 @@ make run-scheduler        # go run ./cmd/scheduler
 make run-worker           # go run ./cmd/worker
 make run-api              # go run ./cmd/api (HTTP_ADDR, default :8080): the API and the dashboard at /
 make redis-up             # Redis 7 in Docker; a local Homebrew `redis-server` works too
+make up / make down       # the whole cluster in Docker (redis, api, scheduler ×2, worker ×5), dashboard on :8080
 
 go test -race -count=1 -run TestName ./internal/queue/    # one test
 REDIS_TEST_ADDR=localhost:6391 go test ./...              # tests against another Redis
@@ -151,6 +152,16 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
 
 - Its 30 s limit applies only when the job has no `Timeout` of its own.
 - Errors name only the URL's scheme and host, so secrets in webhook URLs stay out of logs.
+
+### Docker (`Dockerfile`, `docker-compose.yml`)
+
+- **Image:** one image, distroless and non-root, holding all four binaries in `/usr/local/bin`. Each service sets `command`. `.dockerignore` lets in only `go.mod`, `go.sum`, `cmd/` and `internal/`.
+- **Health checks:** `<binary> healthcheck` (`internal/health`).
+  - Workers and schedulers pass if `HEALTH_FILE` was touched within 5 s. Workers touch it on each registry check-in (`Registry.OnBeat`), schedulers on each acquire or renew that reached Redis (`election.Options.OnContact`).
+  - The API calls its own `/healthz`.
+- **Node IDs:** in a container the process is pid 1, so the default `NODE_ID` is just the hostname, which is the container ID shown by `docker ps`.
+- **Redis unavailable is 503, not 500:** the API answers 503 with `Retry-After: 1` when Redis is down, unreachable, timing out or still `LOADING` after a restart (`redisUnavailable` in `api/server.go`).
+- **Keep the Mac awake:** for long Docker runs, prefix commands with `caffeinate -i`. Idle sleep pauses everything and skews timings.
 
 ### Config
 

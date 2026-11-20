@@ -1,10 +1,41 @@
+# The whole cluster: Redis, the API and dashboard, 2 schedulers (one leads)
+# and 5 workers with 5 slots each, 25 in all.
+#
+#   docker compose up -d --build     build the image and start everything
+#   open http://localhost:8080       the dashboard
+#   docker compose down              stop it (Redis data is kept)
+#
+# Ports are bound to 127.0.0.1, so only this machine can reach them. Set
+# API_TOKEN (in the shell or a .env file) before exposing the API further.
+
+x-app: &app
+  build: .
+  image: job-scheduler:latest
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+  environment: &env
+    REDIS_ADDR: redis:6379
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    API_TOKEN: ${API_TOKEN:-}
+
+# Docker runs each service's `healthcheck` subcommand inside its container.
+x-health: &health
+  interval: 5s
+  timeout: 3s
+  retries: 3
+  start_period: 10s
+
 services:
   redis:
     image: redis:7-alpine
     # AOF with fsync every second: a Redis restart loses at most ~1s of writes.
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    command:
+      ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -12,6 +43,45 @@ services:
       interval: 2s
       timeout: 2s
       retries: 10
+    stop_grace_period: 10s
+
+  api:
+    <<: *app
+    command: ["api"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      <<: *health
+      test: ["CMD", "api", "healthcheck"]
+    # Requests in flight get 5 s to finish.
+    stop_grace_period: 10s
+
+  scheduler:
+    <<: *app
+    command: ["scheduler"]
+    deploy:
+      replicas: 2
+    healthcheck:
+      <<: *health
+      test: ["CMD", "scheduler", "healthcheck"]
+    # A stopping leader hands its seat over at once.
+    stop_grace_period: 5s
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    environment:
+      <<: *env
+      CONCURRENCY: "5"
+      SHUTDOWN_GRACE: 10s
+    deploy:
+      replicas: 5
+    healthcheck:
+      <<: *health
+      test: ["CMD", "worker", "healthcheck"]
+    # SHUTDOWN_GRACE for running jobs, then a few seconds to release the
+    # rest, before Docker sends SIGKILL.
+    stop_grace_period: 15s
 
 volumes:
   redis-data:

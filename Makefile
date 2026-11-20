@@ -1,14 +1,23 @@
 BIN := bin
 
-.PHONY: help redis-up redis-down redis-cli build test vet tidy run-worker run-scheduler run-api
+.PHONY: help up down logs redis-up redis-down redis-cli build test vet tidy run-worker run-scheduler run-api
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
+up: ## Build the image and start the whole cluster in Docker (dashboard on :8080)
+	docker compose up -d --build --wait
+
+down: ## Stop the cluster (Redis data is kept in the redis-data volume)
+	docker compose down
+
+logs: ## Follow the cluster's logs
+	docker compose logs -f --tail 50
+
 redis-up: ## Start Redis in Docker and wait until it is healthy
 	docker compose up -d --wait redis
 
-redis-down: ## Stop Redis (data is kept in the redis-data volume)
+redis-down: ## Stop Redis, and the cluster if it runs (data is kept)
 	docker compose down
 
 redis-cli: ## Open a redis-cli shell in the container

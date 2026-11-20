@@ -2,14 +2,39 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 9 is done. A web dashboard at `http://localhost:8080` shows the leader, workers, queues, throughput and a live event feed, and can replay or purge dead jobs and turn crons on and off. An HTTP API and the `jobctl` command-line tool submit, inspect and cancel jobs, manage the dead-letter queue and crons, and show stats and live events. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 10: Docker images and a 25-worker cluster in Docker Compose.
+**Status:** Phase 10 is done. `make up` builds one Docker image and starts the whole cluster: Redis, the API, 2 schedulers and 5 workers with 5 slots each (25 in all), each with a health check that notices when it loses touch with Redis. A web dashboard at `http://localhost:8080` shows the leader, workers, queues, throughput and a live event feed, and can replay or purge dead jobs and turn crons on and off. An HTTP API and the `jobctl` command-line tool submit, inspect and cancel jobs, manage the dead-letter queue and crons, and show stats and live events. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 11: a load test with 100,000 jobs.
 
 ## Prerequisites
 
-- Go 1.27+
-- Redis 7, either in Docker (`make redis-up`) or a local `redis-server`
+- Docker, to run the whole cluster
+- Go 1.27+ and Redis 7, to build, test or run the binaries directly. Redis can come from Docker (`make redis-up`) or a local `redis-server`
 
-## Quick start
+## Quick start in Docker
+
+```bash
+make up              # builds the image, starts everything, waits until all of it is healthy
+open http://localhost:8080
+make build           # ./bin/jobctl, the command-line client
+./bin/jobctl stats   # 1 leader, 5 workers, 25 slots
+make down            # stops it; Redis data is kept
+```
+
+`docker-compose.yml` runs:
+- Redis, with its append-only file on.
+- The API and dashboard.
+- 2 schedulers, one of which leads.
+- 5 workers with `CONCURRENCY=5`.
+
+All of them share one image, which holds the four binaries and runs as a non-root user with no shell. Ports are bound to `127.0.0.1`, so only this machine can reach the API (`:8080`) and Redis (`:6379`). Set `API_TOKEN` in the shell or a `.env` file before exposing the API further.
+
+- **Scaling:** `docker compose up -d --scale worker=10`.
+- **Stopping:** `docker compose stop` gives workers `SHUTDOWN_GRACE` (10 s) to finish, then they release what's left to other workers.
+- **Health:** each container's health check runs the binary's `healthcheck` subcommand.
+  - Workers and schedulers pass while they got through to Redis in the last 5 s. Each touches `HEALTH_FILE` on every successful call.
+  - The API passes while its `/healthz` answers.
+  - Compose shows the status and holds back dependent services, but doesn't restart an unhealthy container. A crashed one is restarted (`restart: unless-stopped`).
+
+## Quick start without Docker
 
 ```bash
 make redis-up        # Redis in Docker, AOF on
@@ -225,13 +250,14 @@ Every binary reads the same environment variables. An empty variable counts as u
 
 | Variable             | Default            | Meaning                                                                    |
 | -------------------- | ------------------ | -------------------------------------------------------------------------- |
-| `NODE_ID`            | `<hostname>-<pid>` | Identifies this process in leases and logs                                 |
+| `NODE_ID`            | `<hostname>-<pid>` | Identifies this process in leases and logs. In Docker, just the container ID |
 | `LOG_LEVEL`          | `info`             | `debug`, `info`, `warn` or `error`                                         |
 | `REDIS_ADDR`         | `localhost:6379`   | Redis host and port                                                        |
 | `REDIS_PASSWORD`     | (none)             | Redis password                                                             |
 | `REDIS_DB`           | `0`                | Redis database number. Tests use DB 15                                     |
 | `HTTP_ADDR`          | `:8080`            | API and dashboard listen address                                           |
 | `API_TOKEN`          | (none)             | If set, API requests must send `Authorization: Bearer <token>`             |
+| `HEALTH_FILE`        | (none)             | Touched on each successful Redis call, for `healthcheck`. `/tmp/healthy` in the image |
 | `CONCURRENCY`        | `25`               | Jobs one worker process runs at once                                       |
 | `LEASE_TTL`          | `1500ms`           | How long a claimed job stays owned without a heartbeat                     |
 | `HEARTBEAT_EVERY`    | `500ms`            | How often a worker extends its leases. Must be at most half of `LEASE_TTL` |

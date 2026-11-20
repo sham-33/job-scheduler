@@ -2,6 +2,10 @@
 // fall due, takes jobs back from dead workers, and fires crons. Run two or
 // more for failover. They elect one leader, and only the leader does the
 // work.
+//
+// `scheduler healthcheck` exits 0 if a scheduler in the same container got
+// through to Redis recently (it reads HEALTH_FILE), leader or not, for
+// Docker's HEALTHCHECK.
 package main
 
 import (
@@ -12,9 +16,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/sham-33/job-scheduler/internal/config"
 	"github.com/sham-33/job-scheduler/internal/election"
+	"github.com/sham-33/job-scheduler/internal/health"
 	"github.com/sham-33/job-scheduler/internal/logging"
 	"github.com/sham-33/job-scheduler/internal/queue"
 	"github.com/sham-33/job-scheduler/internal/scheduler"
@@ -22,6 +28,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		health.Run(checkHealth)
+	}
 	if err := run(); err != nil {
 		slog.Error("scheduler failed", "err", err)
 		os.Exit(1)
@@ -56,6 +65,7 @@ func run() error {
 		ID:         candidate,
 		TTL:        cfg.LeaderTTL,
 		RenewEvery: cfg.LeaderRenewEvery,
+		OnContact:  health.NewFile(cfg.HealthFile).Touch,
 	}, logger)
 
 	// Run returns once ctx is cancelled and any term in progress has ended,
@@ -65,4 +75,16 @@ func run() error {
 	})
 	logger.Info("shut down")
 	return nil
+}
+
+// checkHealth passes if the scheduler got through to Redis recently. A
+// follower does every LEADER_RENEW_EVERY/4 and a leader every
+// LEADER_RENEW_EVERY, so a few missed calls are allowed, and never less
+// than 5 s.
+func checkHealth() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	return health.CheckFile(cfg.HealthFile, max(5*time.Second, 3*cfg.LeaderRenewEvery))
 }
