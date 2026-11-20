@@ -86,7 +86,7 @@ All timestamps inside scripts come from `redis.call('TIME')`, so every node agre
 
 ```
 cmd/{api,scheduler,worker,jobctl,loadgen,chaos}/
-internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard,events}/
+internal/{config,logging,store,job,queue,election,scheduler,worker,api,dashboard,monitor}/
 internal/queue/scripts/*.lua   (embedded with go:embed, next to the Go code that calls them)
 internal/handlers/             (job types: sleep, echo, flaky, http)
 internal/store/storetest/      (test helper: real Redis on DB 15 plus a key prefix per test)
@@ -343,7 +343,43 @@ Covers the module, config, store, logging, a worker skeleton, docker-compose, th
 
 ---
 
-## Phase 7: Stats, events, and the worker registry
+## Phase 7: Stats, events, and the worker registry ✅ done
+
+**As built:**
+
+- **Events stream:**
+  - `lib.lua` has an `emit()` helper. Every script that changes a job's status calls it, in the same atomic step as the change.
+  - The stream is capped with `XADD … MAXLEN ~ 10000`. Trimming is approximate, so it can briefly hold up to about 100 more.
+  - Each entry has `event, job_id, job_type, from, to, attempt`. It also has `worker` when the change is into or out of `running`, and `error` when there is one.
+  - There is no `ts` field: the stream entry's ID already starts with Redis's time in ms.
+  - Event names: `submitted`, `promoted`, `claimed`, `succeeded`, `failed` (will retry), `dead`, `reclaimed`, `released`, `cancelled`, `replayed`.
+  - A `reclaimed` event names the worker that went silent, so Phase 12 can match it to the worker it killed.
+  - **No events for:** heartbeats, duplicate submissions, or calls rejected by fencing. None of these change a job, and fenced calls are already counted in `stats.fenced`.
+  - A `released` event names the attempt that was interrupted, although that attempt is then given back.
+- **Worker registry:**
+  - Each worker process checks in every 1 s through `beat.lua`, in `internal/monitor/scripts`, which reads Redis's clock.
+  - A check-in sets the worker's score in the `workers` sorted set and writes its `worker:{id}` hash: slots, jobs running, whether it is draining, start time and last-seen time.
+  - A worker unseen for more than 5 s is listed as dead.
+  - **Cleanup:**
+    - A worker that shuts down cleanly removes itself, after its running jobs have stopped. While it drains, it shows `draining`.
+    - A worker that dies stays listed as dead for an hour. Then the next check-in from any worker drops it, and its hash expires.
+  - The registry is only for watching the cluster. Recovering jobs still depends only on leases.
+- **Package name:** `internal/monitor`, not `internal/events`, because it covers more than events.
+  - `Monitor.Snapshot` returns counters, queue sizes, the leader and epoch, and workers in one round trip, plus one more for the workers' details.
+  - `RecentEvents(n)` returns the newest events first.
+  - `EventsAfter(id, n)` pages through the stream oldest first, without gaps or repeats.
+- **Found and fixed while testing:** a worker's details and its last-seen time were read in different round trips. A check-in landing in between could pair new details with the old time. Now both come from the hash, which one check-in writes in a single step. One test in 10 caught it under load.
+
+**Measured with real processes (2 schedulers, 2 workers × 5 slots, 42 jobs, one worker killed with `kill -9` mid-run):**
+
+- The registry showed the killed worker dead 4.5 s after the kill. That is 5 s after its last check-in, which came about 0.5 s before the kill.
+- From the events stream alone, each of its 5 jobs was `reclaimed` from a slot of the dead worker 1,088–1,288 ms after the kill, and `claimed` by the other worker 1,550–1,672 ms after the kill.
+- Event counts matched the counters exactly: 42 submitted, 56 claimed, 40 succeeded, 9 failed and retried, 2 dead, 5 reclaimed.
+- The worker stopped with Ctrl-C left the registry, and the stopped schedulers left no leader.
+- The 10,000-job exactly-once test ran at a median of 15,200 jobs/s, against 16,050 without events. The runs overlapped.
+- 18 deliberate code breaks in a throwaway copy were all caught by the tests. Of the first set:
+  - one changed nothing, a redundant `DEL` that is now removed;
+  - one didn't compile, and was rewritten so it did.
 
 1. Each script XADDs an `events` entry (`MAXLEN ~10000`) with `job_id, type, from, to, worker, ts`.
 2. Workers run `ZADD workers now <id>` every 1 s. A worker unseen for more than 5 s counts as dead.

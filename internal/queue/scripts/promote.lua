@@ -1,6 +1,6 @@
 -- Moves jobs whose run_at has passed from the scheduled set to the ready set.
 --
--- KEYS[1] scheduled zset   KEYS[2] ready zset
+-- KEYS[1] scheduled zset   KEYS[2] ready zset   KEYS[3] events stream
 -- ARGV[1] job key prefix   ARGV[2] max jobs to move
 --
 -- Returns the number of jobs moved.
@@ -19,6 +19,7 @@ for i = 1, #due, 2 do
   if redis.call('HGET', key, 'status') == 'scheduled' then
     redis.call('HSET', key, 'status', 'ready', 'updated_at', now)
     redis.call('ZADD', KEYS[2], run_at, id)
+    emit(KEYS[3], key, id, 'promoted', 'scheduled', 'ready')
     moved = moved + 1
   end
 end

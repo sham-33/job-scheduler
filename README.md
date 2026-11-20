@@ -2,7 +2,7 @@
 
 A fault-tolerant job scheduler in Go and Redis, with leader election, distributed leases, idempotent claims, retries and a dead-letter queue. [docs/PLAN.md](docs/PLAN.md) has the design and the build phases.
 
-**Status:** Phase 6 is done. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 7: stats, events and the worker registry.
+**Status:** Phase 7 is done. Every job state change is now recorded in an `events` stream, each worker process checks in every second so dead ones show up, and one call reads counters, queue sizes, the leader and the workers together. Crons create jobs on a schedule: the leading scheduler makes exactly one job for each scheduled time, even when leadership changes hands, and a cron that fell behind fires once instead of catching up. Schedulers elect a leader through Redis, and only the leader releases delayed jobs, takes jobs back from dead workers and fires crons. If the leader dies, another scheduler takes over within about 3 seconds. Failed jobs are retried with growing waits and end up in a dead-letter queue, from where they can be replayed. The `http` job type calls any web address. Next is Phase 8: an HTTP API and the `jobctl` command-line tool.
 
 ## Prerequisites
 
@@ -79,6 +79,30 @@ A cron is a job template plus a schedule. The leading scheduler checks every 100
 - **Changes:** saving a cron under a name that exists replaces it and restarts its schedule from now. A disabled cron never fires. When turned back on, it restarts from now too, so the slots it missed while off never run.
 
 Crons are stored in a `cron:{name}` hash each, with every name in the `crons` sorted set, scored by its next slot. Phase 8 puts an API and a CLI in front of `queue.PutCron`, `ListCrons`, `SetCronEnabled` and `DeleteCron`.
+
+## Watching the cluster
+
+[internal/monitor](internal/monitor) reads three things the rest of the system writes. Phase 8's API and Phase 9's dashboard are built on it.
+
+- **Counters:** the `stats` hash counts what has happened: `submitted`, `claimed`, `succeeded`, `retried`, `dead`, `reclaimed`, `released`, `fenced`, `cancelled`, `replayed` and `cron_fired`.
+- **Events:** every script that changes a job's status also appends to the `events` stream, in the same atomic step. Each entry records the job, its type, the status it moved from and to, and the attempt number. It also records the worker for changes into or out of `running`, and the error if there is one. The stream keeps about the latest 10,000 events.
+
+  | Event       | Change                                       |
+  | ----------- | -------------------------------------------- |
+  | `submitted` | new → `ready` or `scheduled`                 |
+  | `promoted`  | `scheduled` → `ready`                        |
+  | `claimed`   | `ready` → `running`                          |
+  | `succeeded` | `running` → `succeeded`                      |
+  | `failed`    | `running` → `scheduled`, to be retried       |
+  | `dead`      | `running` → `dead`                           |
+  | `reclaimed` | `running` → `ready`: its worker went silent  |
+  | `released`  | `running` → `ready`: its worker shut down    |
+  | `cancelled` | any unfinished status → `cancelled`          |
+  | `replayed`  | `dead` → `ready`                             |
+
+- **Workers:** each worker process checks in every second, recording its slots, how many jobs it is running, and whether it is shutting down. A worker that hasn't checked in for 5 seconds is listed as dead, and is dropped after an hour. A worker that shuts down cleanly removes itself once its jobs have stopped.
+
+`Monitor.Snapshot` returns counters, queue sizes, the leader and the workers in one call. `RecentEvents` returns the latest events, and `EventsAfter` pages through the stream in order.
 
 ## Delivery
 

@@ -7,7 +7,7 @@
 --
 -- KEYS[1] cron hash   KEYS[2] crons zset   KEYS[3] new job hash
 -- KEYS[4] ready zset   KEYS[5] scheduled zset   KEYS[6] the slot's idempotency key
--- KEYS[7] stats hash
+-- KEYS[7] stats hash   KEYS[8] events stream
 -- ARGV[1] name   ARGV[2] slot, as read from next_run (ms)
 -- ARGV[3] schedule, as read   ARGV[4] the slot after this one (ms)
 -- ARGV[5] new job id   ARGV[6] the slot's idempotency key
@@ -43,7 +43,7 @@ end
 local id = ARGV[5]
 -- run_at is the slot, so the job queues ahead of work that came due later,
 -- and started_at - run_at shows how late it ran against its schedule.
-create_job(KEYS[3], KEYS[4], KEYS[5], KEYS[7], id, tonumber(slot), now, {
+create_job(KEYS[3], KEYS[4], KEYS[5], KEYS[7], KEYS[8], id, tonumber(slot), now, {
   type = job_type, payload = payload, idem_key = ARGV[6], max_attempts = max_attempts,
   timeout_ms = timeout_ms, backoff_base_ms = backoff_base_ms, backoff_max_ms = backoff_max_ms,
 })

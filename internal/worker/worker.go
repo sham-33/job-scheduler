@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sham-33/job-scheduler/internal/job"
+	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
 )
 
@@ -47,6 +49,9 @@ type Options struct {
 	// ShutdownGrace is how long running jobs get to finish after Run's
 	// context is cancelled.
 	ShutdownGrace time.Duration
+	// Registry, if set, lists this process in the worker registry while Run
+	// runs, as ID.
+	Registry *monitor.Registry
 }
 
 // Pool runs up to Concurrency jobs at once in one process. Each slot is a
@@ -58,6 +63,7 @@ type Pool struct {
 	queue    *queue.Queue
 	handlers Handlers
 	logger   *slog.Logger
+	busy     atomic.Int64 // jobs running right now
 }
 
 // NewPool returns a pool that claims jobs from q.
@@ -76,6 +82,24 @@ func (p *Pool) Run(ctx context.Context) {
 	// first and only interrupts running work once the grace period is over.
 	jobsCtx, cancelJobs := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelJobs()
+
+	// The worker stays in the registry until its jobs have stopped, showing
+	// that it is draining once ctx is cancelled.
+	if reg := p.opts.Registry; reg != nil {
+		presenceCtx, leave := context.WithCancel(context.WithoutCancel(ctx))
+		var presence sync.WaitGroup
+		presence.Go(func() {
+			reg.Run(presenceCtx, p.opts.ID, func() monitor.WorkerStatus {
+				return monitor.WorkerStatus{
+					Concurrency: p.opts.Concurrency,
+					Busy:        int(p.busy.Load()),
+					Draining:    ctx.Err() != nil,
+				}
+			})
+		})
+		defer presence.Wait()
+		defer leave()
+	}
 
 	var slots sync.WaitGroup
 	for slot := range p.opts.Concurrency {
@@ -114,7 +138,9 @@ func (p *Pool) runSlot(claimCtx, jobsCtx context.Context, owner string) {
 			sleep(claimCtx, idle.next())
 		default:
 			idle.reset()
+			p.busy.Add(1)
 			p.process(jobsCtx, j)
+			p.busy.Add(-1)
 		}
 	}
 }

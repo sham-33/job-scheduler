@@ -334,7 +334,7 @@ func (q *Queue) fireCron(ctx context.Context, d dueCron, now time.Time) (f CronF
 	id := uid.String()
 	idem := cronIdemPrefix + d.name + ":" + d.slot
 	keys := []string{q.keys.Cron(d.name), q.keys.Crons(), q.keys.Job(id), q.keys.Ready(), q.keys.Scheduled(),
-		q.keys.Idempotency(idem), q.keys.Stats()}
+		q.keys.Idempotency(idem), q.keys.Stats(), q.keys.Events()}
 	reply, err := cronFireScript.Run(ctx, q.rdb, keys,
 		d.name, d.slot, d.schedule, next.UnixMilli(), id, idem, int(IdempotencyTTL.Seconds()),
 	).Slice()

@@ -13,6 +13,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/sham-33/job-scheduler/internal/job"
+	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
 	"github.com/sham-33/job-scheduler/internal/scheduler"
 	"github.com/sham-33/job-scheduler/internal/store"
@@ -614,5 +615,58 @@ func TestPoolStopsWhenCancelled(t *testing.T) {
 	case <-stopped:
 	case <-time.After(time.Second):
 		t.Fatal("pool did not stop within 1s of cancel")
+	}
+}
+
+func TestPoolShowsInRegistryUntilItsJobsStop(t *testing.T) {
+	q, rdb, keys := newQueue(t)
+	m := monitor.New(rdb, keys)
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	stop := startPoolWith(t, q, worker.Options{
+		Concurrency: 3, ShutdownGrace: 5 * time.Second,
+		Registry: monitor.NewRegistry(rdb, keys, slog.New(slog.DiscardHandler)),
+	}, worker.Handlers{"slow": func(context.Context, *job.Job) error {
+		close(started)
+		<-finish
+		return nil
+	}})
+	id := mustEnqueue(t, q, queue.Spec{Type: "slow"})
+	<-started
+
+	workerNow := func() monitor.Worker {
+		t.Helper()
+		ws, err := m.Workers(context.Background())
+		if err != nil || len(ws) != 1 {
+			t.Fatalf("Workers = %+v, %v; want one", ws, err)
+		}
+		return ws[0]
+	}
+	waitWorker := func(what string, ok func(monitor.Worker) bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for w := workerNow(); !ok(w); w = workerNow() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; worker = %+v", what, w)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	// The first check-in can come just before the job is claimed.
+	waitWorker("the job to show as running", func(w monitor.Worker) bool { return w.Busy == 1 })
+	if w := workerNow(); w.ID != "test" || w.Concurrency != 3 || w.Draining || !w.Alive {
+		t.Errorf("worker = %+v, want test, 3 slots, alive, not draining", w)
+	}
+
+	// Shutting down, it stays listed as draining while the job finishes.
+	stopped := make(chan struct{})
+	go func() { stop(); close(stopped) }()
+	waitWorker("the worker to show as draining", func(w monitor.Worker) bool { return w.Draining && w.Busy == 1 })
+
+	close(finish)
+	<-stopped
+	waitStatus(t, q, id, job.StatusSucceeded)
+	if ws, err := m.Workers(context.Background()); err != nil || len(ws) != 0 {
+		t.Errorf("Workers after shutdown = %+v, %v; want none", ws, err)
 	}
 }

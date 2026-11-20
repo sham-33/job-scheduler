@@ -2,7 +2,7 @@
 -- interrupted here: its worker finds out at its next heartbeat and stops.
 --
 -- KEYS[1] job hash   KEYS[2] scheduled zset   KEYS[3] ready zset
--- KEYS[4] leases zset   KEYS[5] stats hash
+-- KEYS[4] leases zset   KEYS[5] stats hash   KEYS[6] events stream
 -- ARGV[1] job id
 --
 -- Returns 1 if the job was cancelled, 0 if it had already finished, or -1 if
@@ -22,4 +22,5 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('HINCRBY', KEYS[5], 'cancelled', 1)
+emit(KEYS[6], KEYS[1], ARGV[1], 'cancelled', status, 'cancelled')
 return 1

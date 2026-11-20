@@ -14,6 +14,7 @@ import (
 	"github.com/sham-33/job-scheduler/internal/config"
 	"github.com/sham-33/job-scheduler/internal/handlers"
 	"github.com/sham-33/job-scheduler/internal/logging"
+	"github.com/sham-33/job-scheduler/internal/monitor"
 	"github.com/sham-33/job-scheduler/internal/queue"
 	"github.com/sham-33/job-scheduler/internal/store"
 	"github.com/sham-33/job-scheduler/internal/worker"
@@ -45,12 +46,14 @@ func run() error {
 	defer rdb.Close()
 	logger.Info("connected", "redis", cfg.RedisAddr, "db", cfg.RedisDB, "concurrency", cfg.Concurrency)
 
-	q := queue.New(rdb, store.Keys{}, cfg.LeaseTTL)
+	keys := store.Keys{}
+	q := queue.New(rdb, keys, cfg.LeaseTTL)
 	pool := worker.NewPool(worker.Options{
 		ID:             cfg.NodeID,
 		Concurrency:    cfg.Concurrency,
 		HeartbeatEvery: cfg.HeartbeatEvery,
 		ShutdownGrace:  cfg.ShutdownGrace,
+		Registry:       monitor.NewRegistry(rdb, keys, logger),
 	}, q, handlers.Default(), logger)
 
 	done := make(chan struct{})

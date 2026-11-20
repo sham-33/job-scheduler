@@ -42,6 +42,7 @@ The scripts live in `internal/queue/scripts/*.lua`, are embedded with `go:embed`
   - `out_of_attempts()` and `bury()`.
   - `create_job()`, shared by `enqueue.lua` and `cron_fire.lua`.
 - **Header comment:** each script starts with one that documents `KEYS`, `ARGV` and the return codes. Keep that format.
+- **Events:** every script that changes a job's status calls `emit()` (also in `lib.lua`) after the change, appending to the `events` stream. Its last `KEYS` entry is the stream. A new status change needs an `emit` and a test in `queue/events_test.go`.
 - **Return codes:** scripts that act for a lease holder (`complete`, `fail`, `heartbeat`, `release`) return `1` for ok, `0` when the lease was lost, and `-1` when the job was cancelled. `leaseErr` maps these to `ErrLeaseLost` / `ErrCancelled`.
 
 Correctness comes from these scripts, never from coordination between processes. A script can run twice, or from two processes at once, and stay correct: each one checks the job's `status` and fencing token before changing anything.
@@ -64,6 +65,9 @@ Every key name comes from `store.Keys`, which adds an optional prefix. Productio
 | `scheduler:epoch`  | counter    | Leadership term number                     |
 | `cron:{name}`      | hash       | A cron: schedule, job template, `next_run` |
 | `crons`            | sorted set | Cron names, scored by next slot in ms      |
+| `events`           | stream     | One entry per job state change, ~10k kept  |
+| `workers`          | sorted set | Worker IDs, scored by last check-in in ms  |
+| `worker:{id}`      | hash       | A worker's slots, busy count, start time   |
 
 Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that reports a duration Redis will use truncates it to milliseconds.
 
@@ -98,6 +102,12 @@ Redis stores durations as whole milliseconds (`*_ms` fields), so Go code that re
   - Results are recorded on `context.WithoutCancel`.
 - **Heartbeat:** a goroutine per job renews the lease. It cancels the job's context, with the _cause_, on `ErrLeaseLost` / `ErrCancelled`, or after a full `LeaseTTL` without a successful renewal.
 - **Outcome order:** the `switch` in `process` is order-sensitive: lease lost → cancelled → success → shutdown (release) → timeout → failure.
+
+### Monitoring (`internal/monitor`)
+
+- **Read-only, apart from the registry:** `Monitor` reads counters, queue sizes, the leader, workers and events.
+- **Registry:** `Registry.Run` checks a worker in every `BeatEvery` (1 s) via `beat.lua`. A worker is dead after `DeadAfter` (5 s) without one. The pool runs it when `worker.Options.Registry` is set, and leaves only after its jobs stop.
+- Nothing about jobs depends on the registry. Leases alone handle dead workers.
 
 ### Leader election (`internal/election`)
 

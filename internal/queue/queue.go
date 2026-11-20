@@ -178,7 +178,7 @@ func (q *Queue) Enqueue(ctx context.Context, s Spec) (id string, created bool, e
 	}
 	id = uid.String()
 
-	keys := []string{q.keys.Job(id), q.keys.Ready(), q.keys.Scheduled(), q.keys.Idempotency(s.IdempotencyKey), q.keys.Stats()}
+	keys := []string{q.keys.Job(id), q.keys.Ready(), q.keys.Scheduled(), q.keys.Idempotency(s.IdempotencyKey), q.keys.Stats(), q.keys.Events()}
 	reply, err := enqueueScript.Run(ctx, q.rdb, keys,
 		id, s.Type, string(s.Payload), s.Delay.Milliseconds(), s.IdempotencyKey, int(IdempotencyTTL.Seconds()),
 		s.MaxAttempts, s.Timeout.Milliseconds(), s.Backoff.Base.Milliseconds(), s.Backoff.Max.Milliseconds(),
@@ -200,7 +200,7 @@ func (q *Queue) Enqueue(ctx context.Context, s Spec) (id string, created bool, e
 // Promote moves up to limit due jobs from scheduled to ready and returns how
 // many it moved.
 func (q *Queue) Promote(ctx context.Context, limit int) (int, error) {
-	n, err := promoteScript.Run(ctx, q.rdb, []string{q.keys.Scheduled(), q.keys.Ready()},
+	n, err := promoteScript.Run(ctx, q.rdb, []string{q.keys.Scheduled(), q.keys.Ready(), q.keys.Events()},
 		q.keys.JobPrefix(), limit,
 	).Int()
 	if err != nil {
@@ -212,7 +212,7 @@ func (q *Queue) Promote(ctx context.Context, limit int) (int, error) {
 // Claim leases the longest-waiting ready job to workerID. It returns
 // (nil, nil) when no job is ready.
 func (q *Queue) Claim(ctx context.Context, workerID string) (*job.Job, error) {
-	keys := []string{q.keys.Ready(), q.keys.Leases(), q.keys.LeaseToken(), q.keys.Stats()}
+	keys := []string{q.keys.Ready(), q.keys.Leases(), q.keys.LeaseToken(), q.keys.Stats(), q.keys.Events()}
 	fields, err := claimScript.Run(ctx, q.rdb, keys,
 		q.keys.JobPrefix(), workerID, q.leaseTTL.Milliseconds(),
 	).StringSlice()
@@ -229,7 +229,7 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*job.Job, error) {
 // fencing token is no longer the job's current one, or ErrCancelled if the
 // job was cancelled while it ran.
 func (q *Queue) Complete(ctx context.Context, j *job.Job) error {
-	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Stats()}
+	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Stats(), q.keys.Events()}
 	code, err := completeScript.Run(ctx, q.rdb, keys, j.ID, j.LeaseToken).Int()
 	if err != nil {
 		return fmt.Errorf("complete: %w", err)
@@ -253,7 +253,7 @@ func (q *Queue) Fail(ctx context.Context, j *job.Job, cause error) (retryIn time
 	// Redis stores whole milliseconds, so report exactly what it will use.
 	retryIn = retryDelay(j.BackoffBase, j.BackoffMax, j.Attempts).Truncate(time.Millisecond)
 
-	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Scheduled(), q.keys.DLQ(), q.keys.Stats()}
+	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Scheduled(), q.keys.DLQ(), q.keys.Stats(), q.keys.Events()}
 	code, err := failScript.Run(ctx, q.rdb, keys, j.ID, j.LeaseToken, msg, retryIn.Milliseconds(), permanent).Int()
 	if err != nil {
 		return 0, false, fmt.Errorf("fail: %w", err)
@@ -269,7 +269,7 @@ func (q *Queue) Fail(ctx context.Context, j *job.Job, cause error) (retryIn time
 // it. Like Complete, it returns ErrLeaseLost or ErrCancelled if the caller no
 // longer owns the job.
 func (q *Queue) Release(ctx context.Context, j *job.Job) error {
-	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Ready(), q.keys.Stats()}
+	keys := []string{q.keys.Job(j.ID), q.keys.Leases(), q.keys.Ready(), q.keys.Stats(), q.keys.Events()}
 	code, err := releaseScript.Run(ctx, q.rdb, keys, j.ID, j.LeaseToken).Int()
 	if err != nil {
 		return fmt.Errorf("release: %w", err)
@@ -306,7 +306,7 @@ func leaseErr(code int) error {
 // many. Each goes back to the ready set, or to the dead-letter queue if it
 // has used up its attempts.
 func (q *Queue) Reap(ctx context.Context, limit int) (int, error) {
-	keys := []string{q.keys.Leases(), q.keys.Ready(), q.keys.DLQ(), q.keys.Stats()}
+	keys := []string{q.keys.Leases(), q.keys.Ready(), q.keys.DLQ(), q.keys.Stats(), q.keys.Events()}
 	n, err := reapScript.Run(ctx, q.rdb, keys, q.keys.JobPrefix(), limit).Int()
 	if err != nil {
 		return 0, fmt.Errorf("reap: %w", err)
@@ -319,7 +319,7 @@ func (q *Queue) Reap(ctx context.Context, limit int) (int, error) {
 // heartbeat. It returns ErrFinished for a job that already succeeded, died
 // or was cancelled.
 func (q *Queue) Cancel(ctx context.Context, id string) error {
-	keys := []string{q.keys.Job(id), q.keys.Scheduled(), q.keys.Ready(), q.keys.Leases(), q.keys.Stats()}
+	keys := []string{q.keys.Job(id), q.keys.Scheduled(), q.keys.Ready(), q.keys.Leases(), q.keys.Stats(), q.keys.Events()}
 	code, err := cancelScript.Run(ctx, q.rdb, keys, id).Int()
 	switch {
 	case err != nil:
@@ -335,7 +335,7 @@ func (q *Queue) Cancel(ctx context.Context, id string) error {
 // Replay moves a job from the dead-letter queue back to the ready set with
 // its attempts reset. It returns ErrNotDead for a job in any other state.
 func (q *Queue) Replay(ctx context.Context, id string) error {
-	keys := []string{q.keys.Job(id), q.keys.DLQ(), q.keys.Ready(), q.keys.Stats()}
+	keys := []string{q.keys.Job(id), q.keys.DLQ(), q.keys.Ready(), q.keys.Stats(), q.keys.Events()}
 	code, err := replayScript.Run(ctx, q.rdb, keys, id).Int()
 	switch {
 	case err != nil:
